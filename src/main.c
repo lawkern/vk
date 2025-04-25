@@ -6,8 +6,10 @@
 
 #include <stdint.h>
 typedef uint32_t u32;
+typedef uint64_t u64;
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +28,10 @@ typedef uint32_t u32;
 typedef struct {
    VkCommandPool pool;
    VkCommandBuffer commands;
+
+   VkSemaphore swapchain_semaphore;
+   VkSemaphore render_semaphore;
+   VkFence render_fence;
 } vulkan_frame_commands;
 
 typedef struct {
@@ -42,11 +48,41 @@ typedef struct {
    VkImage *swapchain_images;
    VkImageView *swapchain_image_views;
 
+   u64 frame_count;
    vulkan_frame_commands frame_commands[2];
 
    VkQueue graphics_queue;
    VkQueue present_queue;
 } vulkan_context;
+
+static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout)
+{
+   VkImageMemoryBarrier2 image_barrier = {0};
+   image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+   image_barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   image_barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+   image_barrier.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+   image_barrier.dstAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT | VK_ACCESS_2_MEMORY_READ_BIT;
+   image_barrier.oldLayout = old_layout;
+   image_barrier.newLayout = new_layout;
+
+   VkImageSubresourceRange subresource_range = {0};
+   subresource_range.aspectMask = (new_layout == VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL)
+      ? VK_IMAGE_ASPECT_DEPTH_BIT
+      : VK_IMAGE_ASPECT_COLOR_BIT;
+   subresource_range.levelCount = VK_REMAINING_MIP_LEVELS;
+   subresource_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+   image_barrier.subresourceRange = subresource_range;
+   image_barrier.image = image;
+
+   VkDependencyInfo dependency_info = {0};
+   dependency_info.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+   dependency_info.imageMemoryBarrierCount = 1;
+   dependency_info.pImageMemoryBarriers = &image_barrier;
+
+   vkCmdPipelineBarrier2(cmd, &dependency_info);
+}
 
 int main(void)
 {
@@ -261,6 +297,16 @@ int main(void)
    float queue_priorities[] = {1.0f};
    VkPhysicalDeviceFeatures device_features = {0};
 
+   VkPhysicalDeviceVulkan13Features features13 = {0};
+   features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+   features13.dynamicRendering = VK_TRUE;
+   features13.synchronization2 = VK_TRUE;
+
+   VkPhysicalDeviceFeatures2 features2 = {0};
+   features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+   features2.pNext = &features13;
+   features2.features = device_features;
+
    int queue_create_info_count = 0;
    VkDeviceQueueCreateInfo queue_create_infos[2] = {0};
 
@@ -281,9 +327,10 @@ int main(void)
 
    VkDeviceCreateInfo device_create_info = {0};
    device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+   device_create_info.pNext = &features2;
+   device_create_info.pEnabledFeatures = 0;
    device_create_info.pQueueCreateInfos = queue_create_infos;
    device_create_info.queueCreateInfoCount = queue_create_info_count;
-   device_create_info.pEnabledFeatures = &device_features;
    if(layers_supported)
    {
       device_create_info.enabledLayerCount = countof(enabled_layers);
@@ -363,7 +410,8 @@ int main(void)
    swapchain_create_info.imageColorSpace = surface_format.colorSpace;
    swapchain_create_info.imageExtent = vk.swapchain_extent;
    swapchain_create_info.imageArrayLayers = 1;
-   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   // swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+   swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    if(graphics_queue_index != present_queue_index)
    {
       swapchain_create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
@@ -427,10 +475,108 @@ int main(void)
       VK_CHECK(vkAllocateCommandBuffers(vk.device, &allocate_info, &vk.frame_commands[frame_index].commands));
    }
 
+   // Initialize synchronization.
+   VkFenceCreateInfo fence_info = {0};
+   fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+   fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+   VkSemaphoreCreateInfo semaphore_info = {0};
+   semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+   for(int frame_index = 0; frame_index < countof(vk.frame_commands); ++frame_index)
+   {
+      VK_CHECK(vkCreateSemaphore(vk.device, &semaphore_info, 0, &vk.frame_commands[frame_index].swapchain_semaphore));
+      VK_CHECK(vkCreateSemaphore(vk.device, &semaphore_info, 0, &vk.frame_commands[frame_index].render_semaphore));
+      VK_CHECK(vkCreateFence(vk.device, &fence_info, 0, &vk.frame_commands[frame_index].render_fence));
+   }
+
+   // Render loop.
+   _Bool quit = 0;
+   while(!quit)
+   {
+      SDL_Event event;
+      while(SDL_PollEvent(&event))
+      {
+         if(event.type == SDL_EVENT_QUIT) quit = 1;
+         if(event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) quit = 1;
+      }
+
+      vulkan_frame_commands *frame = vk.frame_commands + (vk.frame_count % countof(vk.frame_commands));
+
+      VK_CHECK(vkWaitForFences(vk.device, 1, &frame->render_fence, 1, 1000000000));
+      VK_CHECK(vkResetFences(vk.device, 1, &frame->render_fence));
+
+      u32 swapchain_image_index;
+      VK_CHECK(vkAcquireNextImageKHR(vk.device, vk.swapchain, 1000000000, frame->swapchain_semaphore, 0, &swapchain_image_index));
+
+      VkCommandBuffer cmd = frame->commands;
+      VK_CHECK(vkResetCommandBuffer(cmd, 0));
+
+      VkCommandBufferBeginInfo begin_info = {0};
+      begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+      begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+      VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+
+      VkImageSubresourceRange clear_range = {0};
+      clear_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      clear_range.levelCount = VK_REMAINING_MIP_LEVELS;
+      clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+      VkClearColorValue color = {0, 0, 1, 1};
+      vkCmdClearColorImage(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+      VK_CHECK(vkEndCommandBuffer(cmd));
+
+      VkCommandBufferSubmitInfo cmd_info = {0};
+      cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+      cmd_info.commandBuffer = cmd;
+
+      VkSemaphoreSubmitInfo wait_info = {0};
+      wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+      wait_info.semaphore = frame->swapchain_semaphore;
+      wait_info.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
+      wait_info.value = 1;
+
+      VkSemaphoreSubmitInfo signal_info = {0};
+      signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
+      signal_info.semaphore = frame->render_semaphore;
+      signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+      signal_info.value = 1;
+
+      VkSubmitInfo2 submit_info = {0};
+      submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+      submit_info.waitSemaphoreInfoCount = 1;
+      submit_info.pWaitSemaphoreInfos = &wait_info;
+      submit_info.signalSemaphoreInfoCount = 1;
+      submit_info.pSignalSemaphoreInfos = &signal_info;
+      submit_info.commandBufferInfoCount = 1;
+      submit_info.pCommandBufferInfos = &cmd_info;
+
+      VK_CHECK(vkQueueSubmit2(vk.graphics_queue, 1, &submit_info, frame->render_fence));
+
+      VkPresentInfoKHR present_info = {};
+      present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+      present_info.pSwapchains = &vk.swapchain;
+      present_info.swapchainCount = 1;
+      present_info.pWaitSemaphores = &frame->render_semaphore;
+      present_info.waitSemaphoreCount = 1;
+      present_info.pImageIndices = &swapchain_image_index;
+
+      VK_CHECK(vkQueuePresentKHR(vk.graphics_queue, &present_info));
+
+      vk.frame_count++;
+   };
+
    // Clean up.
    vkDeviceWaitIdle(vk.device);
    for(int frame_index = 0; frame_index < countof(vk.frame_commands); ++frame_index)
    {
+      vkDestroyFence(vk.device, vk.frame_commands[frame_index].render_fence, 0);
+      vkDestroySemaphore(vk.device, vk.frame_commands[frame_index].render_semaphore, 0);
+      vkDestroySemaphore(vk.device, vk.frame_commands[frame_index].swapchain_semaphore, 0);
       vkDestroyCommandPool(vk.device, vk.frame_commands[frame_index].pool, 0);
    }
    vkDestroySwapchainKHR(vk.device, vk.swapchain, 0);
