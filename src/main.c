@@ -21,7 +21,7 @@ typedef uint64_t u64;
       if(err != VK_SUCCESS)                                             \
       {                                                                 \
          fprintf(stderr, "Vulkan Error: %s\n", string_VkResult(err));   \
-         exit(1);                                                       \
+         __builtin_trap();                                              \
       }                                                                 \
    } while(0)
 
@@ -52,7 +52,7 @@ typedef struct {
    VkExtent2D swapchain_extent;
    VkFormat swapchain_image_format;
 
-   int swapchain_image_count;
+   u32 swapchain_image_count;
    VkImage *swapchain_images;
    VkImageView *swapchain_image_views;
 
@@ -128,6 +128,11 @@ int main(void)
          instance_extensions_supported = 0;
          break;
       }
+   }
+   if(!instance_extensions_supported)
+   {
+      fprintf(stderr, "Error: Not all requested instance extensions supported.");
+      exit(1);
    }
 
    // Enable layers.
@@ -251,6 +256,12 @@ int main(void)
       }
    }
 
+   if(!device_extensions_supported)
+   {
+      fprintf(stderr, "Error: Not all requested device xtensions supported.");
+      exit(1);
+   }
+
    // Create window.
    window *wnd = create_window("Vulkan Test Program", 400, 300);
    if(!create_window_surface(wnd, vk.instance, &vk.surface))
@@ -302,8 +313,13 @@ int main(void)
    float queue_priorities[] = {1.0f};
    VkPhysicalDeviceFeatures device_features = {0};
 
+   VkPhysicalDeviceVulkan12Features features12 = {0};
+   features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+   features12.bufferDeviceAddress = VK_TRUE;
+
    VkPhysicalDeviceVulkan13Features features13 = {0};
    features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+   features13.pNext = &features12;
    features13.dynamicRendering = VK_TRUE;
    features13.synchronization2 = VK_TRUE;
 
@@ -353,12 +369,12 @@ int main(void)
    VkSurfaceCapabilitiesKHR capabilities = {0};
    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk.gpu, vk.surface, &capabilities);
 
-   int format_count = 0;
+   u32 format_count = 0;
    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.gpu, vk.surface, &format_count, 0);
    VkSurfaceFormatKHR *formats = calloc(format_count, sizeof(*formats));
    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.gpu, vk.surface, &format_count, formats);
 
-   int present_mode_count = 0;
+   u32 present_mode_count = 0;
    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, vk.surface, &present_mode_count, 0);
    VkPresentModeKHR *present_modes = calloc(present_mode_count, sizeof(*present_modes));
    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, vk.surface, &present_mode_count, present_modes);
@@ -392,10 +408,11 @@ int main(void)
    }
    else
    {
-      get_window_dimensions(wnd, &vk.swapchain_extent.width, &vk.swapchain_extent.height);
+      get_window_dimensions(wnd, (int *)&vk.swapchain_extent.width, (int *)&vk.swapchain_extent.height);
 
-      if(vk.swapchain_extent.width  > capabilities.maxImageExtent.width)  vk.swapchain_extent.width = capabilities.maxImageExtent.width;
-      if(vk.swapchain_extent.width  < capabilities.minImageExtent.width)  vk.swapchain_extent.width = capabilities.minImageExtent.width;
+      if(vk.swapchain_extent.width > capabilities.maxImageExtent.width) vk.swapchain_extent.width = capabilities.maxImageExtent.width;
+      if(vk.swapchain_extent.width < capabilities.minImageExtent.width) vk.swapchain_extent.width = capabilities.minImageExtent.width;
+
       if(vk.swapchain_extent.height > capabilities.maxImageExtent.height) vk.swapchain_extent.height = capabilities.maxImageExtent.height;
       if(vk.swapchain_extent.height < capabilities.minImageExtent.height) vk.swapchain_extent.height = capabilities.minImageExtent.height;
    }
@@ -497,12 +514,51 @@ int main(void)
    }
 
    // Initialize allocator.
-   VmaAllocatorCreateInfo allocator_info = {};
+   VmaAllocatorCreateInfo allocator_info = {0};
    allocator_info.physicalDevice = vk.gpu;
    allocator_info.device = vk.device;
    allocator_info.instance = vk.instance;
    allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-   vmaCreateAllocator(&allocator_info, &vk.allocator);
+   VK_CHECK(vmaCreateAllocator(&allocator_info, &vk.allocator));
+
+   // Initialize draw image.
+   VkExtent3D draw_image_extent = {vk.swapchain_extent.width, vk.swapchain_extent.height, 1};
+   vk.draw_image.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+   vk.draw_image.extent = draw_image_extent;
+
+   VkImageUsageFlags draw_image_usages = 0;
+   draw_image_usages |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   draw_image_usages |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   draw_image_usages |= VK_IMAGE_USAGE_STORAGE_BIT;
+   draw_image_usages |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+   VkImageCreateInfo rimg_info = {0};
+   rimg_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+   rimg_info.imageType = VK_IMAGE_TYPE_2D;
+   rimg_info.format = vk.draw_image.format;
+   rimg_info.extent = vk.draw_image.extent;
+   rimg_info.mipLevels = 1;
+   rimg_info.arrayLayers = 1;
+   rimg_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   rimg_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   rimg_info.usage = draw_image_usages;
+
+   VmaAllocationCreateInfo rimg_alloc_info = {0};
+   rimg_alloc_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+   rimg_alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+   VK_CHECK(vmaCreateImage(vk.allocator, &rimg_info, &rimg_alloc_info, &vk.draw_image.image, &vk.draw_image.allocation, 0));
+
+   VkImageViewCreateInfo rview_info = {0};
+   rview_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+   rview_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+   rview_info.image = vk.draw_image.image;
+   rview_info.format = vk.draw_image.format;
+   rview_info.subresourceRange.levelCount = 1;
+   rview_info.subresourceRange.layerCount = 1;
+   rview_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+   VK_CHECK(vkCreateImageView(vk.device, &rview_info, 0, &vk.draw_image.view));
 
    // Render loop.
    while(!window_should_close())
@@ -523,16 +579,50 @@ int main(void)
       begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
       VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
 
-      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+      transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
 
       VkImageSubresourceRange clear_range = {0};
       clear_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
       clear_range.levelCount = VK_REMAINING_MIP_LEVELS;
       clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
 
-      VkClearColorValue color = {0, 0, 1, 1};
-      vkCmdClearColorImage(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
-      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+      VkClearColorValue color = {{0, 0, 1, 1}};
+      vkCmdClearColorImage(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
+
+      transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+      // Copy image to swapchain.
+      VkImageBlit2 blit_region = {0};
+      blit_region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+      blit_region.srcOffsets[1].x = vk.draw_image.extent.width;
+      blit_region.srcOffsets[1].y = vk.draw_image.extent.height;
+      blit_region.srcOffsets[1].z = 1;
+      blit_region.dstOffsets[1].x = vk.swapchain_extent.width;
+      blit_region.dstOffsets[1].y = vk.swapchain_extent.height;
+      blit_region.dstOffsets[1].z = 1;
+      blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit_region.srcSubresource.baseArrayLayer = 0;
+      blit_region.srcSubresource.layerCount = 1;
+      blit_region.srcSubresource.mipLevel = 0;
+      blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+      blit_region.dstSubresource.baseArrayLayer = 0;
+      blit_region.dstSubresource.layerCount = 1;
+      blit_region.dstSubresource.mipLevel = 0;
+
+      VkBlitImageInfo2 blit_info = {0};
+      blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+      blit_info.dstImage = vk.swapchain_images[swapchain_image_index];
+      blit_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      blit_info.srcImage = vk.draw_image.image;
+      blit_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+      blit_info.filter = VK_FILTER_LINEAR;
+      blit_info.regionCount = 1;
+      blit_info.pRegions = &blit_region;
+
+      vkCmdBlitImage2(cmd, &blit_info);
+
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
       VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -579,6 +669,8 @@ int main(void)
    // Clean up.
    vkDeviceWaitIdle(vk.device);
 
+   vkDestroyImageView(vk.device, vk.draw_image.view, 0);
+   vmaDestroyImage(vk.allocator, vk.draw_image.image, vk.draw_image.allocation);
    vmaDestroyAllocator(vk.allocator);
    for(int frame_index = 0; frame_index < countof(vk.frame_commands); ++frame_index)
    {

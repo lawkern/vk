@@ -1,9 +1,12 @@
+CFLAGS = -ggdb -Wall -std=c99
+LDFLAGS = -lm -lstdc++ -lvulkan `pkg-config --libs sdl3`
+
 compile:
-	gcc -o wnd.o -c -g -xc   -DWND_IMPLEMENTATION src/window_creation.h `pkg-config --cflags sdl3`
-	g++ -o vma.o -c -g -xc++ -DVMA_IMPLEMENTATION src/vk_mem_alloc.h
-	gcc -o main.o -c -g src/main.c
-	gcc -o vk main.o wnd.o vma.o -lm -lstdc++ -lvulkan `pkg-config --libs sdl3`
-	rm main.o vma.o
+	mkdir -p build
+	$(CC) -c -o build/vma.o -DVMA_IMPLEMENTATION -xc++ -ggdb src/vk_mem_alloc.h
+	$(CC) -c -o build/wnd.o -DWND_IMPLEMENTATION -xc $(CFLAGS) src/window_creation.h `pkg-config --cflags sdl3`
+	$(CC) -c -o build/main.o $(CFLAGS) src/main.c
+	$(CC) -o build/vk build/main.o build/wnd.o build/vma.o $(LDFLAGS)
 
 run:
-	./vk
+	./build/vk
