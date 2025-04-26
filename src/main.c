@@ -1,8 +1,8 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_enum_string_helper.h>
 
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
+#include "vk_mem_alloc.h"
+#include "window_creation.h"
 
 #include <stdint.h>
 typedef uint32_t u32;
@@ -24,6 +24,14 @@ typedef uint64_t u64;
          exit(1);                                                       \
       }                                                                 \
    } while(0)
+
+typedef struct {
+    VkImage image;
+    VkImageView view;
+    VmaAllocation allocation;
+    VkExtent3D extent;
+    VkFormat format;
+} vulkan_image;
 
 typedef struct {
    VkCommandPool pool;
@@ -53,6 +61,10 @@ typedef struct {
 
    VkQueue graphics_queue;
    VkQueue present_queue;
+
+   VmaAllocator allocator;
+   vulkan_image draw_image;
+   VkExtent2D draw_extent;
 } vulkan_context;
 
 static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout)
@@ -240,16 +252,9 @@ int main(void)
    }
 
    // Create window.
-   SDL_Window *window = SDL_CreateWindow("Vulkan Test Program", 400, 300, SDL_WINDOW_VULKAN);
-   if(!window)
+   window *wnd = create_window("Vulkan Test Program", 400, 300);
+   if(!create_window_surface(wnd, vk.instance, &vk.surface))
    {
-      fprintf(stderr, "Failed to create a window.\n");
-      exit(1);
-   }
-
-   if(!SDL_Vulkan_CreateSurface(window, vk.instance, 0, &vk.surface))
-   {
-      fprintf(stderr, "Failed to create a window surface.\n");
       exit(1);
    }
 
@@ -387,7 +392,8 @@ int main(void)
    }
    else
    {
-      SDL_GetWindowSizeInPixels(window, &vk.swapchain_extent.width, &vk.swapchain_extent.height);
+      get_window_dimensions(wnd, &vk.swapchain_extent.width, &vk.swapchain_extent.height);
+
       if(vk.swapchain_extent.width  > capabilities.maxImageExtent.width)  vk.swapchain_extent.width = capabilities.maxImageExtent.width;
       if(vk.swapchain_extent.width  < capabilities.minImageExtent.width)  vk.swapchain_extent.width = capabilities.minImageExtent.width;
       if(vk.swapchain_extent.height > capabilities.maxImageExtent.height) vk.swapchain_extent.height = capabilities.maxImageExtent.height;
@@ -490,17 +496,17 @@ int main(void)
       VK_CHECK(vkCreateFence(vk.device, &fence_info, 0, &vk.frame_commands[frame_index].render_fence));
    }
 
-   // Render loop.
-   _Bool quit = 0;
-   while(!quit)
-   {
-      SDL_Event event;
-      while(SDL_PollEvent(&event))
-      {
-         if(event.type == SDL_EVENT_QUIT) quit = 1;
-         if(event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_ESCAPE) quit = 1;
-      }
+   // Initialize allocator.
+   VmaAllocatorCreateInfo allocator_info = {};
+   allocator_info.physicalDevice = vk.gpu;
+   allocator_info.device = vk.device;
+   allocator_info.instance = vk.instance;
+   allocator_info.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+   vmaCreateAllocator(&allocator_info, &vk.allocator);
 
+   // Render loop.
+   while(!window_should_close())
+   {
       vulkan_frame_commands *frame = vk.frame_commands + (vk.frame_count % countof(vk.frame_commands));
 
       VK_CHECK(vkWaitForFences(vk.device, 1, &frame->render_fence, 1, 1000000000));
@@ -572,6 +578,8 @@ int main(void)
 
    // Clean up.
    vkDeviceWaitIdle(vk.device);
+
+   vmaDestroyAllocator(vk.allocator);
    for(int frame_index = 0; frame_index < countof(vk.frame_commands); ++frame_index)
    {
       vkDestroyFence(vk.device, vk.frame_commands[frame_index].render_fence, 0);
