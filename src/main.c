@@ -26,11 +26,11 @@ typedef uint64_t u64;
    } while(0)
 
 typedef struct {
-    VkImage image;
-    VkImageView view;
-    VmaAllocation allocation;
-    VkExtent3D extent;
-    VkFormat format;
+   VkImage image;
+   VkImageView view;
+   VmaAllocation allocation;
+   VkExtent3D extent;
+   VkFormat format;
 } vulkan_image;
 
 typedef struct {
@@ -119,7 +119,7 @@ int main(void)
          const char *available_name = instance_extensions[available_index].extensionName;
          if(strcmp(required_name, available_name) == 0)
          {
-            printf("  Extension: %s\n", required_name);
+            // printf("  Extension: %s\n", required_name);
             found = 1;
          }
       }
@@ -155,7 +155,7 @@ int main(void)
          const char *available_name = available_layers[available_index].layerName;
          if(strcmp(required_name, available_name) == 0)
          {
-            printf("  Layer: %s\n", required_name);
+            // printf("  Layer: %s\n", required_name);
             found = 1;
          }
       }
@@ -245,7 +245,7 @@ int main(void)
          const char *available_name = device_extensions[available_index].extensionName;
          if(strcmp(required_name, available_name) == 0)
          {
-            printf("  Extension: %s\n", required_name);
+            // printf("  Extension: %s\n", required_name);
             found = 1;
          }
       }
@@ -417,7 +417,7 @@ int main(void)
       if(vk.swapchain_extent.height < capabilities.minImageExtent.height) vk.swapchain_extent.height = capabilities.minImageExtent.height;
    }
 
-   printf("  Swap extent: %d, %d\n", vk.swapchain_extent.width, vk.swapchain_extent.height);
+   // printf("  Swap extent: %d, %d\n", vk.swapchain_extent.width, vk.swapchain_extent.height);
 
    vk.swapchain_image_count = capabilities.minImageCount + 1;
    if(capabilities.maxImageCount > 0 && vk.swapchain_image_count > capabilities.maxImageCount)
@@ -560,6 +560,104 @@ int main(void)
 
    VK_CHECK(vkCreateImageView(vk.device, &rview_info, 0, &vk.draw_image.view));
 
+   // Initialize descriptors.
+   VkDescriptorSetLayoutBinding binding = {0};
+   binding.binding = 0;
+   binding.descriptorCount = 1;
+   binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+   binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+   VkDescriptorSetLayoutCreateInfo layout_info = {0};
+   layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+   layout_info.pNext = 0;
+   layout_info.pBindings = &binding;
+   layout_info.bindingCount = 1;
+   layout_info.flags = 0;
+
+   VkDescriptorSetLayout layout;
+   VK_CHECK(vkCreateDescriptorSetLayout(vk.device, &layout_info, 0, &layout));
+
+   u32 max_sets = 10;
+   VkDescriptorPoolSize pool_size = {0};
+   pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+   pool_size.descriptorCount = 1 * max_sets;
+
+   VkDescriptorPoolCreateInfo pool_info = {0};
+   pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+   pool_info.maxSets = max_sets;
+   pool_info.poolSizeCount = 1;
+   pool_info.pPoolSizes = &pool_size;
+
+   VkDescriptorPool pool;
+   vkCreateDescriptorPool(vk.device, &pool_info, 0, &pool);
+
+   VkDescriptorSetAllocateInfo allocation_info = {0};
+   allocation_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+   allocation_info.descriptorPool = pool;
+   allocation_info.descriptorSetCount = 1;
+   allocation_info.pSetLayouts = &layout;
+
+   VkDescriptorSet descriptor_set;
+   VK_CHECK(vkAllocateDescriptorSets(vk.device, &allocation_info, &descriptor_set));
+
+   VkDescriptorImageInfo image_info = {0};
+   image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+   image_info.imageView = vk.draw_image.view;
+
+   VkWriteDescriptorSet draw_image_write = {0};
+   draw_image_write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+   draw_image_write.dstBinding = 0;
+   draw_image_write.dstSet = descriptor_set;
+   draw_image_write.descriptorCount = 1;
+   draw_image_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+   draw_image_write.pImageInfo = &image_info;
+
+   vkUpdateDescriptorSets(vk.device, 1, &draw_image_write, 0, 0);
+
+   // Load shaders.
+   FILE *shader_file = fopen("shaders/gradient.comp.spv", "rb");
+   assert(shader_file);
+
+   fseek(shader_file, 0, SEEK_END);
+   size_t shader_file_size = ftell(shader_file);
+   fseek(shader_file, 0, SEEK_SET);
+
+   u32 *shader_code = malloc(shader_file_size);
+   assert(shader_code);
+
+   fread(shader_code, shader_file_size, 1, shader_file);
+   fclose(shader_file);
+
+   VkShaderModuleCreateInfo shader_create_info = {0};
+   shader_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+   shader_create_info.codeSize = shader_file_size;
+   shader_create_info.pCode = shader_code;
+
+   VkShaderModule shader_module;
+   VK_CHECK(vkCreateShaderModule(vk.device, &shader_create_info, 0, &shader_module));
+
+   VkPipelineLayoutCreateInfo compute_layout = {0};
+   compute_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   compute_layout.pSetLayouts = &layout;
+   compute_layout.setLayoutCount = 1;
+
+   VkPipelineLayout gradient_pipeline_layout;
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout, 0, &gradient_pipeline_layout));
+
+   VkPipelineShaderStageCreateInfo stage_create_info = {0};
+   stage_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+   stage_create_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+   stage_create_info.module = shader_module;
+   stage_create_info.pName = "main";
+
+   VkComputePipelineCreateInfo compute_pipeline_create_info = {0};
+   compute_pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+   compute_pipeline_create_info.layout = gradient_pipeline_layout;
+   compute_pipeline_create_info.stage = stage_create_info;
+
+   VkPipeline gradient_pipeline;
+   VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient_pipeline));
+
    // Render loop.
    while(!window_should_close())
    {
@@ -588,6 +686,10 @@ int main(void)
 
       VkClearColorValue color = {{0, 0, 1, 1}};
       vkCmdClearColorImage(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
+
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradient_pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradient_pipeline_layout, 0, 1, &descriptor_set, 0, 0);
+      vkCmdDispatch(cmd, ceilf(vk.draw_image.extent.width/16.0f), ceilf(vk.draw_image.extent.height/16.0f), 1);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
       transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -630,30 +732,28 @@ int main(void)
       cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
       cmd_info.commandBuffer = cmd;
 
-      VkSemaphoreSubmitInfo wait_info = {0};
-      wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-      wait_info.semaphore = frame->swapchain_semaphore;
-      wait_info.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR;
-      wait_info.value = 1;
-
-      VkSemaphoreSubmitInfo signal_info = {0};
-      signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-      signal_info.semaphore = frame->render_semaphore;
-      signal_info.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
-      signal_info.value = 1;
-
       VkSubmitInfo2 submit_info = {0};
       submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
       submit_info.waitSemaphoreInfoCount = 1;
-      submit_info.pWaitSemaphoreInfos = &wait_info;
+      submit_info.pWaitSemaphoreInfos = &(VkSemaphoreSubmitInfo){
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+         .semaphore = frame->swapchain_semaphore,
+         .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+         .value = 1,
+      };
       submit_info.signalSemaphoreInfoCount = 1;
-      submit_info.pSignalSemaphoreInfos = &signal_info;
+      submit_info.pSignalSemaphoreInfos = &(VkSemaphoreSubmitInfo){
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+         .semaphore = frame->render_semaphore,
+         .stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,
+         .value = 1,
+      };
       submit_info.commandBufferInfoCount = 1;
       submit_info.pCommandBufferInfos = &cmd_info;
 
       VK_CHECK(vkQueueSubmit2(vk.graphics_queue, 1, &submit_info, frame->render_fence));
 
-      VkPresentInfoKHR present_info = {};
+      VkPresentInfoKHR present_info = {0};
       present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
       present_info.pSwapchains = &vk.swapchain;
       present_info.swapchainCount = 1;
@@ -668,6 +768,13 @@ int main(void)
 
    // Clean up.
    vkDeviceWaitIdle(vk.device);
+
+   vkDestroyShaderModule(vk.device, shader_module, 0);
+   vkDestroyPipelineLayout(vk.device, gradient_pipeline_layout, 0);
+   vkDestroyPipeline(vk.device, gradient_pipeline, 0);
+
+   vkDestroyDescriptorPool(vk.device, pool, 0);
+   vkDestroyDescriptorSetLayout(vk.device, layout, 0);
 
    vkDestroyImageView(vk.device, vk.draw_image.view, 0);
    vmaDestroyImage(vk.allocator, vk.draw_image.image, vk.draw_image.allocation);
