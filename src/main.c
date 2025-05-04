@@ -1,71 +1,5 @@
-#include <vulkan/vulkan.h>
-#include <vulkan/vk_enum_string_helper.h>
-
-#include "vk_mem_alloc.h"
+#include "vk.h"
 #include "window_creation.h"
-
-#include <stdint.h>
-typedef uint32_t u32;
-typedef uint64_t u64;
-
-#include <assert.h>
-#include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#define countof(array) (sizeof(array) / sizeof((array)[0]))
-#define VK_CHECK(result)                                                \
-   do {                                                                 \
-      VkResult err = (result);                                          \
-      if(err != VK_SUCCESS)                                             \
-      {                                                                 \
-         fprintf(stderr, "Vulkan Error: %s\n", string_VkResult(err));   \
-         __builtin_trap();                                              \
-      }                                                                 \
-   } while(0)
-
-typedef struct {
-   VkImage image;
-   VkImageView view;
-   VmaAllocation allocation;
-   VkExtent3D extent;
-   VkFormat format;
-} vulkan_image;
-
-typedef struct {
-   VkCommandPool pool;
-   VkCommandBuffer commands;
-
-   VkSemaphore swapchain_semaphore;
-   VkSemaphore render_semaphore;
-   VkFence render_fence;
-} vulkan_frame_commands;
-
-typedef struct {
-   VkInstance instance;
-   VkPhysicalDevice gpu;
-   VkDevice device;
-   VkSurfaceKHR surface;
-
-   VkSwapchainKHR swapchain;
-   VkExtent2D swapchain_extent;
-   VkFormat swapchain_image_format;
-
-   u32 swapchain_image_count;
-   VkImage *swapchain_images;
-   VkImageView *swapchain_image_views;
-
-   u64 frame_count;
-   vulkan_frame_commands frame_commands[2];
-
-   VkQueue graphics_queue;
-   VkQueue present_queue;
-
-   VmaAllocator allocator;
-   vulkan_image draw_image;
-   VkExtent2D draw_extent;
-} vulkan_context;
 
 static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout)
 {
@@ -96,12 +30,47 @@ static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout o
    vkCmdPipelineBarrier2(cmd, &dependency_info);
 }
 
+typedef void command_function(VkCommandBuffer cmd);
+
+static void immediate_submit(vulkan_context *vk, command_function *function)
+{
+   VK_CHECK(vkResetFences(vk->device, 1, &vk->immediate_fence));
+   VK_CHECK(vkResetCommandBuffer(vk->immediate_command_buffer, 0));
+
+   VkCommandBuffer cmd = vk->immediate_command_buffer;
+
+   VkCommandBufferBeginInfo begin_info = {0};
+   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+   begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+
+   function(cmd);
+
+   VK_CHECK(vkEndCommandBuffer(cmd));
+
+   VkCommandBufferSubmitInfo cmd_info = {0};
+   cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+   cmd_info.commandBuffer = cmd;
+
+   VkSubmitInfo2 submit_info = {0};
+   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+   submit_info.waitSemaphoreInfoCount = 0;
+   submit_info.pWaitSemaphoreInfos = 0;
+   submit_info.signalSemaphoreInfoCount = 0;
+   submit_info.pSignalSemaphoreInfos = 0;
+   submit_info.commandBufferInfoCount = 1;
+   submit_info.pCommandBufferInfos = &cmd_info;
+
+   VK_CHECK(vkQueueSubmit2(vk->graphics_queue, 1, &submit_info, vk->immediate_fence));
+   VK_CHECK(vkWaitForFences(vk->device, 1, &vk->immediate_fence, 0, UINT64_MAX));
+}
+
 int main(void)
 {
    vulkan_context vk = {0};
 
    // Enable instance extensions.
-   _Bool instance_extensions_supported = 1;
+   b32 instance_extensions_supported = 1;
    const char *enabled_instance_extensions[] = {"VK_EXT_debug_utils", "VK_KHR_surface", "VK_KHR_xlib_surface"};
 
    u32 instance_extension_count = 0;
@@ -112,7 +81,7 @@ int main(void)
 
    for(int index = 0; index < countof(enabled_instance_extensions); ++index)
    {
-      _Bool found = 0;
+      b32 found = 0;
       const char *required_name = enabled_instance_extensions[index];
       for(int available_index = 0; available_index < instance_extension_count; ++available_index)
       {
@@ -136,7 +105,7 @@ int main(void)
    }
 
    // Enable layers.
-   _Bool layers_supported = 1;
+   b32 layers_supported = 1;
    const char *enabled_layers[] = {"VK_LAYER_KHRONOS_validation"};
 
    u32 layer_count;
@@ -147,7 +116,7 @@ int main(void)
 
    for(int index = 0; index < countof(enabled_layers); ++index)
    {
-      _Bool found = 0;
+      b32 found = 0;
 
       const char *required_name = enabled_layers[index];
       for(int available_index = 0; available_index < layer_count; ++available_index)
@@ -227,7 +196,7 @@ int main(void)
    }
 
    // Enable device extensions.
-   _Bool device_extensions_supported = 1;
+   b32 device_extensions_supported = 1;
    const char *enabled_device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
    u32 device_extension_count = 0;
@@ -238,7 +207,7 @@ int main(void)
 
    for(int index = 0; index < countof(enabled_device_extensions); ++index)
    {
-      _Bool found = 0;
+      b32 found = 0;
       const char *required_name = enabled_device_extensions[index];
       for(int available_index = 0; available_index < device_extension_count; ++available_index)
       {
@@ -262,9 +231,8 @@ int main(void)
       exit(1);
    }
 
-   // Create window.
-   window *wnd = create_window("Vulkan Test Program", 400, 300);
-   if(!create_window_surface(wnd, vk.instance, &vk.surface))
+   // Create window and surface.
+   if(!create_window(&vk, "Vulkan Test Program", 400*2, 300*2))
    {
       exit(1);
    }
@@ -276,13 +244,13 @@ int main(void)
    VkQueueFamilyProperties *queue_families = calloc(queue_family_count, sizeof(*queue_families));
    vkGetPhysicalDeviceQueueFamilyProperties(vk.gpu, &queue_family_count, queue_families);
 
-   _Bool graphics_queue_found = 0;
+   b32 graphics_queue_found = 0;
    u32 graphics_queue_index;
 
-   _Bool present_queue_found = 0;
+   b32 present_queue_found = 0;
    u32 present_queue_index;
 
-   _Bool found_all = 0;
+   b32 found_all = 0;
    for(int queue_family_index = 0; queue_family_index < queue_family_count; ++queue_family_index)
    {
       VkQueueFamilyProperties family = queue_families[queue_family_index];
@@ -408,7 +376,7 @@ int main(void)
    }
    else
    {
-      get_window_dimensions(wnd, (int *)&vk.swapchain_extent.width, (int *)&vk.swapchain_extent.height);
+      get_window_dimensions(&vk, (int *)&vk.swapchain_extent.width, (int *)&vk.swapchain_extent.height);
 
       if(vk.swapchain_extent.width > capabilities.maxImageExtent.width) vk.swapchain_extent.width = capabilities.maxImageExtent.width;
       if(vk.swapchain_extent.width < capabilities.minImageExtent.width) vk.swapchain_extent.width = capabilities.minImageExtent.width;
@@ -658,6 +626,20 @@ int main(void)
    VkPipeline gradient_pipeline;
    VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient_pipeline));
 
+   VkCommandPool immediate_command_pool;
+   VK_CHECK(vkCreateCommandPool(vk.device, &command_pool_info, 0, &immediate_command_pool));
+
+   VkCommandBufferAllocateInfo command_allocate_info = {0};
+   command_allocate_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+   command_allocate_info.commandPool = immediate_command_pool;
+   command_allocate_info.commandBufferCount = 1;
+   command_allocate_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+
+   VK_CHECK(vkAllocateCommandBuffers(vk.device, &command_allocate_info, &vk.immediate_command_buffer));
+   VK_CHECK(vkCreateFence(vk.device, &fence_info, 0, &vk.immediate_fence));
+
+   initialize_imgui(&vk);
+
    // Render loop.
    while(!window_should_close())
    {
@@ -724,7 +706,12 @@ int main(void)
 
       vkCmdBlitImage2(cmd, &blit_info);
 
-      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+      // transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+
+      // copy_image_to_image(cmd, _drawImage.image, _swapchainImages[swapchainImageIndex], _drawExtent, _swapchainExtent);
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      draw_imgui(&vk, cmd,  vk.swapchain_image_views[swapchain_image_index]);
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
       VK_CHECK(vkEndCommandBuffer(cmd));
 
@@ -769,6 +756,9 @@ int main(void)
    // Clean up.
    vkDeviceWaitIdle(vk.device);
 
+   deinitialize_imgui(&vk);
+   vkDestroyFence(vk.device, vk.immediate_fence, 0);
+   vkDestroyCommandPool(vk.device, immediate_command_pool, 0);
    vkDestroyShaderModule(vk.device, shader_module, 0);
    vkDestroyPipelineLayout(vk.device, gradient_pipeline_layout, 0);
    vkDestroyPipeline(vk.device, gradient_pipeline, 0);
