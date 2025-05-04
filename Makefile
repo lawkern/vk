@@ -5,6 +5,7 @@ LDFLAGS = -lm -lstdc++ -lvulkan `pkg-config --libs sdl3`
 compile:
 	mkdir -p build
 	glslc -o shaders/gradient.comp.spv shaders/gradient.comp
+	glslc -o shaders/gradient_color.comp.spv shaders/gradient_color.comp
 
 	$(CC) -c -o build/imgui.o             $(CXXFLAGS) dependencies/imgui.cpp
 	$(CC) -c -o build/imgui_impl_sdl3.o   $(CXXFLAGS) dependencies/imgui_impl_sdl3.cpp

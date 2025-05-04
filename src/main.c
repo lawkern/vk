@@ -583,7 +583,7 @@ int main(void)
    vkUpdateDescriptorSets(vk.device, 1, &draw_image_write, 0, 0);
 
    // Load shaders.
-   FILE *shader_file = fopen("shaders/gradient.comp.spv", "rb");
+   FILE *shader_file = fopen("shaders/gradient_color.comp.spv", "rb");
    assert(shader_file);
 
    fseek(shader_file, 0, SEEK_END);
@@ -609,6 +609,14 @@ int main(void)
    compute_layout.pSetLayouts = &layout;
    compute_layout.setLayoutCount = 1;
 
+   VkPushConstantRange push_constant_range = {0};
+   push_constant_range.offset = 0;
+   push_constant_range.size = sizeof(compute_push_constants);
+   push_constant_range.stageFlags =  VK_SHADER_STAGE_COMPUTE_BIT;
+
+   compute_layout.pPushConstantRanges = &push_constant_range;
+   compute_layout.pushConstantRangeCount = 1;
+
    VkPipelineLayout gradient_pipeline_layout;
    VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout, 0, &gradient_pipeline_layout));
 
@@ -623,8 +631,15 @@ int main(void)
    compute_pipeline_create_info.layout = gradient_pipeline_layout;
    compute_pipeline_create_info.stage = stage_create_info;
 
-   VkPipeline gradient_pipeline;
-   VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient_pipeline));
+   compute_effect gradient = {0};
+   gradient.name = "gradient";
+   gradient.layout = gradient_pipeline_layout;
+   gradient.constants.data[0] = (vec4){1, 0, 0, 1};
+   gradient.constants.data[1] = (vec4){0, 0, 1, 1};
+
+   VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient.pipeline));
+
+   vk.background_effect = gradient;
 
    VkCommandPool immediate_command_pool;
    VK_CHECK(vkCreateCommandPool(vk.device, &command_pool_info, 0, &immediate_command_pool));
@@ -641,7 +656,7 @@ int main(void)
    initialize_imgui(&vk);
 
    // Render loop.
-   while(!window_should_close())
+   while(!window_should_close(&vk))
    {
       vulkan_frame_commands *frame = vk.frame_commands + (vk.frame_count % countof(vk.frame_commands));
 
@@ -669,8 +684,9 @@ int main(void)
       VkClearColorValue color = {{0, 0, 1, 1}};
       vkCmdClearColorImage(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
 
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradient_pipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, gradient_pipeline_layout, 0, 1, &descriptor_set, 0, 0);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk.background_effect.pipeline);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk.background_effect.layout, 0, 1, &descriptor_set, 0, 0);
+      vkCmdPushConstants(cmd, vk.background_effect.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vk.background_effect.constants), &vk.background_effect.constants);
       vkCmdDispatch(cmd, ceilf(vk.draw_image.extent.width/16.0f), ceilf(vk.draw_image.extent.height/16.0f), 1);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -760,8 +776,8 @@ int main(void)
    vkDestroyFence(vk.device, vk.immediate_fence, 0);
    vkDestroyCommandPool(vk.device, immediate_command_pool, 0);
    vkDestroyShaderModule(vk.device, shader_module, 0);
-   vkDestroyPipelineLayout(vk.device, gradient_pipeline_layout, 0);
-   vkDestroyPipeline(vk.device, gradient_pipeline, 0);
+   vkDestroyPipelineLayout(vk.device, vk.background_effect.layout, 0);
+   vkDestroyPipeline(vk.device, vk.background_effect.pipeline, 0);
 
    vkDestroyDescriptorPool(vk.device, pool, 0);
    vkDestroyDescriptorSetLayout(vk.device, layout, 0);

@@ -37,7 +37,7 @@ EXTERN_C bool get_window_dimensions(vulkan_context *vk, int *width, int *height)
    return(result);
 }
 
-EXTERN_C bool window_should_close(void)
+EXTERN_C bool window_should_close(vulkan_context *vk)
 {
    bool result = false;
 
@@ -54,7 +54,17 @@ EXTERN_C bool window_should_close(void)
    ImGui_ImplSDL3_NewFrame();
    ImGui::NewFrame();
 
-   ImGui::ShowDemoWindow();
+   if(ImGui::Begin("background"))
+   {
+      compute_effect *effect = &vk->background_effect;
+      ImGui::Text("Effect: %s", effect->name);
+      ImGui::InputFloat4("data[0]", (float *)(effect->constants.data + 0));
+      ImGui::InputFloat4("data[1]", (float *)(effect->constants.data + 1));
+      ImGui::InputFloat4("data[2]", (float *)(effect->constants.data + 2));
+      ImGui::InputFloat4("data[3]", (float *)(effect->constants.data + 3));
+   }
+   ImGui::End();
+
    ImGui::Render();
 
    return(result);

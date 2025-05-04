@@ -10,6 +10,21 @@ typedef int32_t b32;
 typedef uint32_t u32;
 typedef uint64_t u64;
 
+typedef struct {
+   float x, y, z, w;
+} vec4;
+
+typedef struct {
+   vec4 data[4];
+} compute_push_constants;
+
+typedef struct {
+   char *name;
+   VkPipeline pipeline;
+   VkPipelineLayout layout;
+   compute_push_constants constants;
+} compute_effect;
+
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -78,4 +93,6 @@ typedef struct {
 
    VkFence immediate_fence;
    VkCommandBuffer immediate_command_buffer;
+
+   compute_effect background_effect;
 } vulkan_context;
