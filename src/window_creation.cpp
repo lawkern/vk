@@ -112,7 +112,7 @@ EXTERN_C void initialize_imgui(vulkan_context *vk)
    init_info.PipelineRenderingCreateInfo = {};
    init_info.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
    init_info.PipelineRenderingCreateInfo.colorAttachmentCount = 1;
-   init_info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &vk->swapchain_image_format;
+   init_info.PipelineRenderingCreateInfo.pColorAttachmentFormats = &vk->draw_image.format;
    init_info.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
 
    ImGui_ImplVulkan_Init(&init_info);

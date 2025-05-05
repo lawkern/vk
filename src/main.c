@@ -1,6 +1,30 @@
 #include "vk.h"
 #include "window_creation.h"
 
+static void load_shader_module(VkShaderModule *result, VkDevice device, memory_arena arena, char *path)
+{
+   FILE *shader_file = fopen(path, "rb");
+   assert(shader_file);
+
+   fseek(shader_file, 0, SEEK_END);
+   size_t shader_file_size = ftell(shader_file);
+   fseek(shader_file, 0, SEEK_SET);
+
+   memory_index count = shader_file_size / sizeof(u32);
+   u32 *shader_code = allocate(&arena, count, u32);
+   assert(shader_code);
+
+   fread(shader_code, shader_file_size, 1, shader_file);
+   fclose(shader_file);
+
+   VkShaderModuleCreateInfo shader_module_info = {0};
+   shader_module_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+   shader_module_info.codeSize = shader_file_size;
+   shader_module_info.pCode = shader_code;
+
+   VK_CHECK(vkCreateShaderModule(device, &shader_module_info, 0, result));
+}
+
 static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout old_layout, VkImageLayout new_layout)
 {
    VkImageMemoryBarrier2 image_barrier = {0};
@@ -30,109 +54,234 @@ static void transition_image(VkCommandBuffer cmd, VkImage image, VkImageLayout o
    vkCmdPipelineBarrier2(cmd, &dependency_info);
 }
 
-typedef void command_function(VkCommandBuffer cmd);
-
-static void immediate_submit(vulkan_context *vk, command_function *function)
+static void copy_image(VkCommandBuffer cmd, VkImage src, VkImage dst, VkExtent2D src_size, VkExtent2D dst_size)
 {
-   VK_CHECK(vkResetFences(vk->device, 1, &vk->immediate_fence));
-   VK_CHECK(vkResetCommandBuffer(vk->immediate_command_buffer, 0));
+   VkImageBlit2 blit_region = {0};
+   blit_region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
+   blit_region.srcOffsets[1].x = src_size.width;
+   blit_region.srcOffsets[1].y = src_size.height;
+   blit_region.srcOffsets[1].z = 1;
+   blit_region.dstOffsets[1].x = dst_size.width;
+   blit_region.dstOffsets[1].y = dst_size.height;
+   blit_region.dstOffsets[1].z = 1;
+   blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   blit_region.srcSubresource.baseArrayLayer = 0;
+   blit_region.srcSubresource.layerCount = 1;
+   blit_region.srcSubresource.mipLevel = 0;
+   blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   blit_region.dstSubresource.baseArrayLayer = 0;
+   blit_region.dstSubresource.layerCount = 1;
+   blit_region.dstSubresource.mipLevel = 0;
 
-   VkCommandBuffer cmd = vk->immediate_command_buffer;
+   VkBlitImageInfo2 blit_info = {0};
+   blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
+   blit_info.dstImage = dst;
+   blit_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+   blit_info.srcImage = src;
+   blit_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+   blit_info.filter = VK_FILTER_LINEAR;
+   blit_info.regionCount = 1;
+   blit_info.pRegions = &blit_region;
 
-   VkCommandBufferBeginInfo begin_info = {0};
-   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-   begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-   VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+   vkCmdBlitImage2(cmd, &blit_info);
+}
 
-   function(cmd);
+static void initialize_pipeline_config(vulkan_pipeline_configuration *config)
+{
+   config->input_assembly         = (VkPipelineInputAssemblyStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+   config->rasterizer             = (VkPipelineRasterizationStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+   config->color_blend_attachment = (VkPipelineColorBlendAttachmentState){0};
+   config->multisampling          = (VkPipelineMultisampleStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+   config->layout                 = (VkPipelineLayout){0};
+   config->depth_stencil          = (VkPipelineDepthStencilStateCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+   config->rendering_info         = (VkPipelineRenderingCreateInfo){.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
 
-   VK_CHECK(vkEndCommandBuffer(cmd));
+   for(int shader_index = 0; shader_index < countof(config->shader_stages); ++shader_index)
+   {
+      config->shader_stages[shader_index] = (VkPipelineShaderStageCreateInfo){0};
+   }
+}
 
-   VkCommandBufferSubmitInfo cmd_info = {0};
-   cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
-   cmd_info.commandBuffer = cmd;
+static VkPipeline create_pipeline(vulkan_pipeline_configuration *config, VkDevice device)
+{
+   VkPipelineViewportStateCreateInfo viewport_state = {0};
+   viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+   viewport_state.viewportCount = 1;
+   viewport_state.scissorCount = 1;
 
-   VkSubmitInfo2 submit_info = {0};
-   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-   submit_info.waitSemaphoreInfoCount = 0;
-   submit_info.pWaitSemaphoreInfos = 0;
-   submit_info.signalSemaphoreInfoCount = 0;
-   submit_info.pSignalSemaphoreInfos = 0;
-   submit_info.commandBufferInfoCount = 1;
-   submit_info.pCommandBufferInfos = &cmd_info;
+   VkPipelineColorBlendStateCreateInfo color_blending = {0};
+   color_blending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+   color_blending.logicOpEnable = VK_FALSE;
+   color_blending.logicOp = VK_LOGIC_OP_COPY;
+   color_blending.attachmentCount = 1;
+   color_blending.pAttachments = &config->color_blend_attachment;
 
-   VK_CHECK(vkQueueSubmit2(vk->graphics_queue, 1, &submit_info, vk->immediate_fence));
-   VK_CHECK(vkWaitForFences(vk->device, 1, &vk->immediate_fence, 0, UINT64_MAX));
+   VkPipelineVertexInputStateCreateInfo vertex_input_info = {0};
+   vertex_input_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+   VkGraphicsPipelineCreateInfo pipeline_info = {0};
+   pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+   pipeline_info.pNext = &config->rendering_info;
+
+   pipeline_info.stageCount = countof(config->shader_stages);
+   pipeline_info.pStages = config->shader_stages;
+   pipeline_info.pVertexInputState = &vertex_input_info;
+   pipeline_info.pInputAssemblyState = &config->input_assembly;
+   pipeline_info.pViewportState = &viewport_state;
+   pipeline_info.pRasterizationState = &config->rasterizer;
+   pipeline_info.pMultisampleState = &config->multisampling;
+   pipeline_info.pColorBlendState = &color_blending;
+   pipeline_info.pDepthStencilState = &config->depth_stencil;
+   pipeline_info.layout = config->layout;
+
+   VkDynamicState dynamic_states[] = {
+      VK_DYNAMIC_STATE_VIEWPORT,
+      VK_DYNAMIC_STATE_SCISSOR,
+   };
+   VkPipelineDynamicStateCreateInfo dynamic_info = {0};
+   dynamic_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+   dynamic_info.pDynamicStates = dynamic_states;
+   dynamic_info.dynamicStateCount = countof(dynamic_states);
+
+   pipeline_info.pDynamicState = &dynamic_info;
+
+   VkPipeline result;
+   VK_CHECK(vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipeline_info, 0, &result));
+
+   return(result);
+}
+
+static void draw_background(vulkan_context *vk, VkDescriptorSet *descriptor_set, VkCommandBuffer cmd)
+{
+   VkImageSubresourceRange clear_range = {0};
+   clear_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   clear_range.levelCount = VK_REMAINING_MIP_LEVELS;
+   clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+
+   VkClearColorValue color = {{0, 0, 1, 1}};
+   vkCmdClearColorImage(cmd, vk->draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
+
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->background_effect.pipeline);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->background_effect.layout, 0, 1, descriptor_set, 0, 0);
+   vkCmdPushConstants(cmd, vk->background_effect.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vk->background_effect.constants), &vk->background_effect.constants);
+   vkCmdDispatch(cmd, ceilf(vk->draw_extent.width/16.0f), ceilf(vk->draw_extent.height/16.0f), 1);
+}
+
+static void draw_geometry(vulkan_context *vk, VkCommandBuffer cmd)
+{
+   VkRenderingAttachmentInfo color_attachment_info = {0};
+   color_attachment_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+   color_attachment_info.imageView = vk->draw_image.view;
+   color_attachment_info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+   color_attachment_info.resolveMode = 0;
+   color_attachment_info.resolveImageView = 0;
+   color_attachment_info.resolveImageLayout = 0;
+   color_attachment_info.loadOp = 0;
+   color_attachment_info.storeOp = 0;
+   color_attachment_info.clearValue = (VkClearValue){0};
+
+   VkRenderingInfo rendering_info = {0};
+   rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+   rendering_info.renderArea = (VkRect2D){.extent = vk->draw_extent};
+   rendering_info.layerCount = 1;
+   rendering_info.viewMask = 0;
+   rendering_info.colorAttachmentCount = 1;
+   rendering_info.pColorAttachments = &color_attachment_info;
+   rendering_info.pDepthAttachment = 0;
+   rendering_info.pStencilAttachment = 0;
+
+   vkCmdBeginRendering(cmd, &rendering_info);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->triangle_pipeline);
+
+   VkViewport viewport = {0};
+   viewport.x = 0;
+   viewport.y = 0;
+   viewport.width = vk->draw_extent.width;
+   viewport.height = vk->draw_extent.height;
+   viewport.minDepth = 0.f;
+   viewport.maxDepth = 1.f;
+
+   vkCmdSetViewport(cmd, 0, 1, &viewport);
+
+   VkRect2D scissor = {0};
+   scissor.offset.x = 0;
+   scissor.offset.y = 0;
+   scissor.extent.width = vk->draw_extent.width;
+   scissor.extent.height = vk->draw_extent.height;
+
+   vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+   vkCmdDraw(cmd, 3, 1, 0, 0);
+
+   vkCmdEndRendering(cmd);
 }
 
 int main(void)
 {
-   vulkan_context vk = {0};
+   memory_index arena_size = 1024*1024;
+   memory_arena arena = {0};
+   arena.begin = malloc(arena_size);
+   arena.end = arena.begin + arena_size;
 
    // Enable instance extensions.
-   b32 instance_extensions_supported = 1;
-   const char *enabled_instance_extensions[] = {"VK_EXT_debug_utils", "VK_KHR_surface", "VK_KHR_xlib_surface"};
-
    u32 instance_extension_count = 0;
    vkEnumerateInstanceExtensionProperties(0, &instance_extension_count, 0);
 
-   VkExtensionProperties *instance_extensions = calloc(instance_extension_count, sizeof(*instance_extensions));
+   VkExtensionProperties *instance_extensions = allocate(&arena, instance_extension_count, VkExtensionProperties);
    vkEnumerateInstanceExtensionProperties(0, &instance_extension_count, instance_extensions);
 
-   for(int index = 0; index < countof(enabled_instance_extensions); ++index)
+   const char *required_instance_extensions[] = {
+      "VK_EXT_debug_utils",
+      "VK_KHR_surface",
+      "VK_KHR_xlib_surface",
+   };
+   for(int required_index = 0; required_index < countof(required_instance_extensions); ++required_index)
    {
       b32 found = 0;
-      const char *required_name = enabled_instance_extensions[index];
+      const char *required_name = required_instance_extensions[required_index];
       for(int available_index = 0; available_index < instance_extension_count; ++available_index)
       {
          const char *available_name = instance_extensions[available_index].extensionName;
          if(strcmp(required_name, available_name) == 0)
          {
-            // printf("  Extension: %s\n", required_name);
             found = 1;
+            break;
          }
       }
       if(!found)
       {
-         instance_extensions_supported = 0;
-         break;
+         fprintf(stderr, "Error: Requested instance extension %s not available.\n", required_name);
+         exit(1);
       }
-   }
-   if(!instance_extensions_supported)
-   {
-      fprintf(stderr, "Error: Not all requested instance extensions supported.");
-      exit(1);
    }
 
    // Enable layers.
-   b32 layers_supported = 1;
-   const char *enabled_layers[] = {"VK_LAYER_KHRONOS_validation"};
-
    u32 layer_count;
    vkEnumerateInstanceLayerProperties(&layer_count, 0);
 
-   VkLayerProperties *available_layers = calloc(layer_count, sizeof(*available_layers));
+   VkLayerProperties *available_layers = allocate(&arena, layer_count, VkLayerProperties);
    vkEnumerateInstanceLayerProperties(&layer_count, available_layers);
 
-   for(int index = 0; index < countof(enabled_layers); ++index)
+   const char *required_layers[] = {
+      "VK_LAYER_KHRONOS_validation",
+   };
+   for(int index = 0; index < countof(required_layers); ++index)
    {
       b32 found = 0;
-
-      const char *required_name = enabled_layers[index];
+      const char *required_name = required_layers[index];
       for(int available_index = 0; available_index < layer_count; ++available_index)
       {
          const char *available_name = available_layers[available_index].layerName;
          if(strcmp(required_name, available_name) == 0)
          {
-            // printf("  Layer: %s\n", required_name);
             found = 1;
+            break;
          }
       }
-
       if(!found)
       {
-         layers_supported = 0;
-         break;
+         fprintf(stderr, "Error: Requested layer %s not available.\n", required_name);
+         exit(1);
       }
    }
 
@@ -145,90 +294,81 @@ int main(void)
    application_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
    application_info.apiVersion = VK_API_VERSION_1_3;
 
-   VkInstanceCreateInfo create_info = {0};
-   create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-   create_info.pApplicationInfo = &application_info;
-   if(layers_supported)
-   {
-      create_info.enabledLayerCount = countof(enabled_layers);
-      create_info.ppEnabledLayerNames = enabled_layers;
-   }
-   create_info.enabledExtensionCount = countof(enabled_instance_extensions);
-   create_info.ppEnabledExtensionNames = enabled_instance_extensions;
+   VkInstanceCreateInfo instance_create_info = {0};
+   instance_create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+   instance_create_info.pApplicationInfo = &application_info;
+   instance_create_info.enabledLayerCount = countof(required_layers);
+   instance_create_info.ppEnabledLayerNames = required_layers;
+   instance_create_info.enabledExtensionCount = countof(required_instance_extensions);
+   instance_create_info.ppEnabledExtensionNames = required_instance_extensions;
 
-   VK_CHECK(vkCreateInstance(&create_info, 0, &vk.instance));
+   vulkan_context vk = {0};
+   VK_CHECK(vkCreateInstance(&instance_create_info, 0, &vk.instance));
 
    // Get physical GPU.
-   vk.gpu = VK_NULL_HANDLE;
-
-   uint32_t device_count = 0;
-   vkEnumeratePhysicalDevices(vk.instance, &device_count, 0);
-   if(device_count == 0)
+   uint32_t gpu_count = 0;
+   vkEnumeratePhysicalDevices(vk.instance, &gpu_count, 0);
+   if(gpu_count == 0)
    {
       fprintf(stderr, "Failed to enumerate physical GPUs.\n");
       exit(1);
    }
 
-   VkPhysicalDevice *available_devices = calloc(device_count, sizeof(*available_devices));
-   vkEnumeratePhysicalDevices(vk.instance, &device_count, available_devices);
+   VkPhysicalDevice *available_gpus = allocate(&arena, gpu_count, VkPhysicalDevice);
+   vkEnumeratePhysicalDevices(vk.instance, &gpu_count, available_gpus);
 
-   for(int device_index = 0; device_index < device_count; ++device_index)
+   for(int gpu_index = 0; gpu_index < gpu_count; ++gpu_index)
    {
-      VkPhysicalDevice device = available_devices[device_index];
+      VkPhysicalDevice gpu = available_gpus[gpu_index];
 
       VkPhysicalDeviceProperties properties;
-      vkGetPhysicalDeviceProperties(device, &properties);
+      vkGetPhysicalDeviceProperties(gpu, &properties);
 
       VkPhysicalDeviceFeatures features;
-      vkGetPhysicalDeviceFeatures(device, &features);
+      vkGetPhysicalDeviceFeatures(gpu, &features);
 
       if(features.geometryShader &&
          (properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ||
           properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU))
       {
-         vk.gpu = device;
+         vk.gpu = gpu;
+         break;
       }
    }
-   if(vk.gpu == VK_NULL_HANDLE)
+   if(!vk.gpu)
    {
       fprintf(stderr, "Failed to identify a suitable GPU.\n");
       exit(1);
    }
 
    // Enable device extensions.
-   b32 device_extensions_supported = 1;
-   const char *enabled_device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-
    u32 device_extension_count = 0;
    vkEnumerateDeviceExtensionProperties(vk.gpu, 0, &device_extension_count, 0);
 
-   VkExtensionProperties *device_extensions = calloc(device_extension_count, sizeof(*device_extensions));
+   VkExtensionProperties *device_extensions = allocate(&arena, device_extension_count, VkExtensionProperties);
    vkEnumerateDeviceExtensionProperties(vk.gpu, 0, &device_extension_count, device_extensions);
 
-   for(int index = 0; index < countof(enabled_device_extensions); ++index)
+   const char *required_device_extensions[] = {
+      VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+   };
+   for(int required_index = 0; required_index < countof(required_device_extensions); ++required_index)
    {
       b32 found = 0;
-      const char *required_name = enabled_device_extensions[index];
+      const char *required_name = required_device_extensions[required_index];
       for(int available_index = 0; available_index < device_extension_count; ++available_index)
       {
          const char *available_name = device_extensions[available_index].extensionName;
          if(strcmp(required_name, available_name) == 0)
          {
-            // printf("  Extension: %s\n", required_name);
             found = 1;
+            break;
          }
       }
       if(!found)
       {
-         device_extensions_supported = 0;
-         break;
+         fprintf(stderr, "Error: Requested device extension %s not available.\n", required_name);
+         exit(1);
       }
-   }
-
-   if(!device_extensions_supported)
-   {
-      fprintf(stderr, "Error: Not all requested device xtensions supported.");
-      exit(1);
    }
 
    // Create window and surface.
@@ -241,7 +381,7 @@ int main(void)
    u32 queue_family_count = 0;
    vkGetPhysicalDeviceQueueFamilyProperties(vk.gpu, &queue_family_count, 0);
 
-   VkQueueFamilyProperties *queue_families = calloc(queue_family_count, sizeof(*queue_families));
+   VkQueueFamilyProperties *queue_families = allocate(&arena, queue_family_count, VkQueueFamilyProperties);
    vkGetPhysicalDeviceQueueFamilyProperties(vk.gpu, &queue_family_count, queue_families);
 
    b32 graphics_queue_found = 0;
@@ -259,7 +399,7 @@ int main(void)
          graphics_queue_index = queue_family_index;
          graphics_queue_found = 1;
 
-         VkBool32 present_support = 0;
+         VkBool32 present_support;
          vkGetPhysicalDeviceSurfaceSupportKHR(vk.gpu, queue_family_index, vk.surface, &present_support);
 
          if(present_support)
@@ -320,13 +460,10 @@ int main(void)
    device_create_info.pEnabledFeatures = 0;
    device_create_info.pQueueCreateInfos = queue_create_infos;
    device_create_info.queueCreateInfoCount = queue_create_info_count;
-   if(layers_supported)
-   {
-      device_create_info.enabledLayerCount = countof(enabled_layers);
-      device_create_info.ppEnabledLayerNames = enabled_layers;
-   }
-   device_create_info.enabledExtensionCount = countof(enabled_device_extensions);
-   device_create_info.ppEnabledExtensionNames = enabled_device_extensions;
+   device_create_info.enabledLayerCount = countof(required_layers);
+   device_create_info.ppEnabledLayerNames = required_layers;
+   device_create_info.enabledExtensionCount = countof(required_device_extensions);
+   device_create_info.ppEnabledExtensionNames = required_device_extensions;
 
    VK_CHECK(vkCreateDevice(vk.gpu, &device_create_info, 0, &vk.device));
 
@@ -339,12 +476,12 @@ int main(void)
 
    u32 format_count = 0;
    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.gpu, vk.surface, &format_count, 0);
-   VkSurfaceFormatKHR *formats = calloc(format_count, sizeof(*formats));
+   VkSurfaceFormatKHR *formats = allocate(&arena, format_count, VkSurfaceFormatKHR);
    vkGetPhysicalDeviceSurfaceFormatsKHR(vk.gpu, vk.surface, &format_count, formats);
 
    u32 present_mode_count = 0;
    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, vk.surface, &present_mode_count, 0);
-   VkPresentModeKHR *present_modes = calloc(present_mode_count, sizeof(*present_modes));
+   VkPresentModeKHR *present_modes = allocate(&arena, present_mode_count, VkPresentModeKHR);
    vkGetPhysicalDeviceSurfacePresentModesKHR(vk.gpu, vk.surface, &present_mode_count, present_modes);
 
    VkSurfaceFormatKHR surface_format = formats[0];
@@ -385,8 +522,6 @@ int main(void)
       if(vk.swapchain_extent.height < capabilities.minImageExtent.height) vk.swapchain_extent.height = capabilities.minImageExtent.height;
    }
 
-   // printf("  Swap extent: %d, %d\n", vk.swapchain_extent.width, vk.swapchain_extent.height);
-
    vk.swapchain_image_count = capabilities.minImageCount + 1;
    if(capabilities.maxImageCount > 0 && vk.swapchain_image_count > capabilities.maxImageCount)
    {
@@ -401,7 +536,6 @@ int main(void)
    swapchain_create_info.imageColorSpace = surface_format.colorSpace;
    swapchain_create_info.imageExtent = vk.swapchain_extent;
    swapchain_create_info.imageArrayLayers = 1;
-   // swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
    swapchain_create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
    if(graphics_queue_index != present_queue_index)
    {
@@ -424,10 +558,10 @@ int main(void)
    vk.swapchain_image_format = surface_format.format;
 
    vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &vk.swapchain_image_count, 0);
-   vk.swapchain_images = calloc(vk.swapchain_image_count, sizeof(*vk.swapchain_images));
+   vk.swapchain_images = allocate(&arena, vk.swapchain_image_count, VkImage);
    vkGetSwapchainImagesKHR(vk.device, vk.swapchain, &vk.swapchain_image_count, vk.swapchain_images);
 
-   vk.swapchain_image_views = calloc(vk.swapchain_image_count, sizeof(*vk.swapchain_image_views));
+   vk.swapchain_image_views = allocate(&arena, vk.swapchain_image_count, VkImageView);
    for(int image_index = 0; image_index < vk.swapchain_image_count; ++image_index)
    {
       VkImageViewCreateInfo info = {0};
@@ -500,33 +634,33 @@ int main(void)
    draw_image_usages |= VK_IMAGE_USAGE_STORAGE_BIT;
    draw_image_usages |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-   VkImageCreateInfo rimg_info = {0};
-   rimg_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-   rimg_info.imageType = VK_IMAGE_TYPE_2D;
-   rimg_info.format = vk.draw_image.format;
-   rimg_info.extent = vk.draw_image.extent;
-   rimg_info.mipLevels = 1;
-   rimg_info.arrayLayers = 1;
-   rimg_info.samples = VK_SAMPLE_COUNT_1_BIT;
-   rimg_info.tiling = VK_IMAGE_TILING_OPTIMAL;
-   rimg_info.usage = draw_image_usages;
+   VkImageCreateInfo image_create_info = {0};
+   image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+   image_create_info.imageType = VK_IMAGE_TYPE_2D;
+   image_create_info.format = vk.draw_image.format;
+   image_create_info.extent = vk.draw_image.extent;
+   image_create_info.mipLevels = 1;
+   image_create_info.arrayLayers = 1;
+   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
+   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+   image_create_info.usage = draw_image_usages;
 
-   VmaAllocationCreateInfo rimg_alloc_info = {0};
-   rimg_alloc_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-   rimg_alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+   VmaAllocationCreateInfo image_alloc_info = {0};
+   image_alloc_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+   image_alloc_info.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-   VK_CHECK(vmaCreateImage(vk.allocator, &rimg_info, &rimg_alloc_info, &vk.draw_image.image, &vk.draw_image.allocation, 0));
+   VK_CHECK(vmaCreateImage(vk.allocator, &image_create_info, &image_alloc_info, &vk.draw_image.image, &vk.draw_image.allocation, 0));
 
-   VkImageViewCreateInfo rview_info = {0};
-   rview_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-   rview_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-   rview_info.image = vk.draw_image.image;
-   rview_info.format = vk.draw_image.format;
-   rview_info.subresourceRange.levelCount = 1;
-   rview_info.subresourceRange.layerCount = 1;
-   rview_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   VkImageViewCreateInfo image_view_info = {0};
+   image_view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+   image_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+   image_view_info.image = vk.draw_image.image;
+   image_view_info.format = vk.draw_image.format;
+   image_view_info.subresourceRange.levelCount = 1;
+   image_view_info.subresourceRange.layerCount = 1;
+   image_view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
 
-   VK_CHECK(vkCreateImageView(vk.device, &rview_info, 0, &vk.draw_image.view));
+   VK_CHECK(vkCreateImageView(vk.device, &image_view_info, 0, &vk.draw_image.view));
 
    // Initialize descriptors.
    VkDescriptorSetLayoutBinding binding = {0};
@@ -583,47 +717,43 @@ int main(void)
    vkUpdateDescriptorSets(vk.device, 1, &draw_image_write, 0, 0);
 
    // Load shaders.
-   FILE *shader_file = fopen("shaders/gradient_color.comp.spv", "rb");
-   assert(shader_file);
+   VkShaderModule compute_shader_module;
+   load_shader_module(&compute_shader_module, vk.device, arena, "shaders/gradient_color.comp.spv");
 
-   fseek(shader_file, 0, SEEK_END);
-   size_t shader_file_size = ftell(shader_file);
-   fseek(shader_file, 0, SEEK_SET);
+   VkShaderModule vertex_shader_module;
+   load_shader_module(&vertex_shader_module, vk.device, arena, "shaders/triangle.vert.spv");
 
-   u32 *shader_code = malloc(shader_file_size);
-   assert(shader_code);
+   VkShaderModule fragment_shader_module;
+   load_shader_module(&fragment_shader_module, vk.device, arena, "shaders/triangle.frag.spv");
 
-   fread(shader_code, shader_file_size, 1, shader_file);
-   fclose(shader_file);
+   VkPipelineLayoutCreateInfo pipeline_layout_info = {0};
+   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   pipeline_layout_info.pSetLayouts = &layout;
+   pipeline_layout_info.setLayoutCount = 1;
 
-   VkShaderModuleCreateInfo shader_create_info = {0};
-   shader_create_info.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-   shader_create_info.codeSize = shader_file_size;
-   shader_create_info.pCode = shader_code;
-
-   VkShaderModule shader_module;
-   VK_CHECK(vkCreateShaderModule(vk.device, &shader_create_info, 0, &shader_module));
-
-   VkPipelineLayoutCreateInfo compute_layout = {0};
-   compute_layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-   compute_layout.pSetLayouts = &layout;
-   compute_layout.setLayoutCount = 1;
+   VkPipelineLayoutCreateInfo compute_layout_info = {0};
+   compute_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   compute_layout_info.pSetLayouts = &layout;
+   compute_layout_info.setLayoutCount = 1;
 
    VkPushConstantRange push_constant_range = {0};
    push_constant_range.offset = 0;
    push_constant_range.size = sizeof(compute_push_constants);
-   push_constant_range.stageFlags =  VK_SHADER_STAGE_COMPUTE_BIT;
+   push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
-   compute_layout.pPushConstantRanges = &push_constant_range;
-   compute_layout.pushConstantRangeCount = 1;
+   compute_layout_info.pPushConstantRanges = &push_constant_range;
+   compute_layout_info.pushConstantRangeCount = 1;
 
    VkPipelineLayout gradient_pipeline_layout;
-   VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout, 0, &gradient_pipeline_layout));
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout_info, 0, &gradient_pipeline_layout));
+
+   VkPipelineLayout triangle_pipeline_layout;
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &pipeline_layout_info, 0, &triangle_pipeline_layout));
 
    VkPipelineShaderStageCreateInfo stage_create_info = {0};
    stage_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
    stage_create_info.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-   stage_create_info.module = shader_module;
+   stage_create_info.module = compute_shader_module;
    stage_create_info.pName = "main";
 
    VkComputePipelineCreateInfo compute_pipeline_create_info = {0};
@@ -640,6 +770,58 @@ int main(void)
    VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient.pipeline));
 
    vk.background_effect = gradient;
+
+   vulkan_pipeline_configuration triangle_pipeline_config = {0};
+   initialize_pipeline_config(&triangle_pipeline_config);
+
+   triangle_pipeline_config.layout = triangle_pipeline_layout;
+   triangle_pipeline_config.input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   triangle_pipeline_config.input_assembly.primitiveRestartEnable = VK_FALSE;
+
+   triangle_pipeline_config.rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+   triangle_pipeline_config.rasterizer.lineWidth = 1.0f;
+   triangle_pipeline_config.rasterizer.cullMode = VK_CULL_MODE_NONE;
+   triangle_pipeline_config.rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+
+   triangle_pipeline_config.shader_stages[0] = (VkPipelineShaderStageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_VERTEX_BIT,
+      .module = vertex_shader_module,
+      .pName = "main",
+   };
+   triangle_pipeline_config.shader_stages[1] = (VkPipelineShaderStageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .module = fragment_shader_module,
+      .pName = "main",
+   };
+
+   triangle_pipeline_config.multisampling.sampleShadingEnable = VK_FALSE;
+   triangle_pipeline_config.multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+   triangle_pipeline_config.multisampling.minSampleShading = 1.0f;
+   triangle_pipeline_config.multisampling.pSampleMask = 0;
+   triangle_pipeline_config.multisampling.alphaToCoverageEnable = VK_FALSE;
+   triangle_pipeline_config.multisampling.alphaToOneEnable = VK_FALSE;
+
+   triangle_pipeline_config.color_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+   triangle_pipeline_config.color_blend_attachment.blendEnable = VK_FALSE;
+
+   triangle_pipeline_config.color_attachment_format = vk.draw_image.format;
+   triangle_pipeline_config.rendering_info.colorAttachmentCount = 1;
+   triangle_pipeline_config.rendering_info.pColorAttachmentFormats = &triangle_pipeline_config.color_attachment_format;
+
+   triangle_pipeline_config.rendering_info.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+   triangle_pipeline_config.depth_stencil.depthTestEnable = VK_FALSE;
+   triangle_pipeline_config.depth_stencil.depthWriteEnable = VK_FALSE;
+   triangle_pipeline_config.depth_stencil.depthCompareOp = VK_COMPARE_OP_NEVER;
+   triangle_pipeline_config.depth_stencil.depthBoundsTestEnable = VK_FALSE;
+   triangle_pipeline_config.depth_stencil.stencilTestEnable = VK_FALSE;
+   triangle_pipeline_config.depth_stencil.front = (VkStencilOpState){0};
+   triangle_pipeline_config.depth_stencil.back = (VkStencilOpState){0};
+   triangle_pipeline_config.depth_stencil.minDepthBounds = 0.f;
+   triangle_pipeline_config.depth_stencil.maxDepthBounds = 1.f;
+
+   vk.triangle_pipeline = create_pipeline(&triangle_pipeline_config, vk.device);
 
    VkCommandPool immediate_command_pool;
    VK_CHECK(vkCreateCommandPool(vk.device, &command_pool_info, 0, &immediate_command_pool));
@@ -660,6 +842,9 @@ int main(void)
    {
       vulkan_frame_commands *frame = vk.frame_commands + (vk.frame_count % countof(vk.frame_commands));
 
+      vk.draw_extent.width = vk.draw_image.extent.width;
+      vk.draw_extent.height = vk.draw_image.extent.height;
+
       VK_CHECK(vkWaitForFences(vk.device, 1, &frame->render_fence, 1, 1000000000));
       VK_CHECK(vkResetFences(vk.device, 1, &frame->render_fence));
 
@@ -674,61 +859,19 @@ int main(void)
       begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
       VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
 
+      // Draw background.
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+      draw_background(&vk, &descriptor_set, cmd);
 
-      VkImageSubresourceRange clear_range = {0};
-      clear_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      clear_range.levelCount = VK_REMAINING_MIP_LEVELS;
-      clear_range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+      transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+      draw_geometry(&vk, cmd);
+      draw_imgui(&vk, cmd, vk.draw_image.view);
 
-      VkClearColorValue color = {{0, 0, 1, 1}};
-      vkCmdClearColorImage(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, &color, 1, &clear_range);
-
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk.background_effect.pipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk.background_effect.layout, 0, 1, &descriptor_set, 0, 0);
-      vkCmdPushConstants(cmd, vk.background_effect.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(vk.background_effect.constants), &vk.background_effect.constants);
-      vkCmdDispatch(cmd, ceilf(vk.draw_image.extent.width/16.0f), ceilf(vk.draw_image.extent.height/16.0f), 1);
-
-      transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+      transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
       transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+      copy_image(cmd, vk.draw_image.image, vk.swapchain_images[swapchain_image_index], vk.draw_extent, vk.swapchain_extent);
 
-      // Copy image to swapchain.
-      VkImageBlit2 blit_region = {0};
-      blit_region.sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2;
-      blit_region.srcOffsets[1].x = vk.draw_image.extent.width;
-      blit_region.srcOffsets[1].y = vk.draw_image.extent.height;
-      blit_region.srcOffsets[1].z = 1;
-      blit_region.dstOffsets[1].x = vk.swapchain_extent.width;
-      blit_region.dstOffsets[1].y = vk.swapchain_extent.height;
-      blit_region.dstOffsets[1].z = 1;
-      blit_region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      blit_region.srcSubresource.baseArrayLayer = 0;
-      blit_region.srcSubresource.layerCount = 1;
-      blit_region.srcSubresource.mipLevel = 0;
-      blit_region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-      blit_region.dstSubresource.baseArrayLayer = 0;
-      blit_region.dstSubresource.layerCount = 1;
-      blit_region.dstSubresource.mipLevel = 0;
-
-      VkBlitImageInfo2 blit_info = {0};
-      blit_info.sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2;
-      blit_info.dstImage = vk.swapchain_images[swapchain_image_index];
-      blit_info.dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-      blit_info.srcImage = vk.draw_image.image;
-      blit_info.srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-      blit_info.filter = VK_FILTER_LINEAR;
-      blit_info.regionCount = 1;
-      blit_info.pRegions = &blit_region;
-
-      vkCmdBlitImage2(cmd, &blit_info);
-
-      // transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
-      // copy_image_to_image(cmd, _drawImage.image, _swapchainImages[swapchainImageIndex], _drawExtent, _swapchainExtent);
-      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-      draw_imgui(&vk, cmd,  vk.swapchain_image_views[swapchain_image_index]);
-      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-
+      transition_image(cmd, vk.swapchain_images[swapchain_image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
       VK_CHECK(vkEndCommandBuffer(cmd));
 
       VkCommandBufferSubmitInfo cmd_info = {0};
@@ -775,9 +918,16 @@ int main(void)
    deinitialize_imgui(&vk);
    vkDestroyFence(vk.device, vk.immediate_fence, 0);
    vkDestroyCommandPool(vk.device, immediate_command_pool, 0);
-   vkDestroyShaderModule(vk.device, shader_module, 0);
+
+   vkDestroyShaderModule(vk.device, compute_shader_module, 0);
+   vkDestroyShaderModule(vk.device, vertex_shader_module, 0);
+   vkDestroyShaderModule(vk.device, fragment_shader_module, 0);
+
    vkDestroyPipelineLayout(vk.device, vk.background_effect.layout, 0);
+   vkDestroyPipelineLayout(vk.device, triangle_pipeline_layout, 0);
+
    vkDestroyPipeline(vk.device, vk.background_effect.pipeline, 0);
+   vkDestroyPipeline(vk.device, vk.triangle_pipeline, 0);
 
    vkDestroyDescriptorPool(vk.device, pool, 0);
    vkDestroyDescriptorSetLayout(vk.device, layout, 0);
