@@ -54,13 +54,28 @@ static inline void *allocate_(memory_arena *arena, memory_index count, memory_in
     return memset(result, 0, count*size);
 }
 
+typedef struct {float x, y, z;} vec3;
+typedef struct {float x, y, z, w;} vec4;
+typedef struct {vec4 a, b, c, d;} mat4;
+
 typedef struct {
-   float x, y, z, w;
-} vec4;
+   vec3 position;
+   float uv_x;
+
+   vec3 normal;
+   float uv_y;
+
+   vec4 color;
+} vertex;
 
 typedef struct {
    vec4 data[4];
 } compute_push_constants;
+
+typedef struct {
+   mat4 world_matrix;
+   VkDeviceAddress vertex_buffer;
+} mesh_push_constants;
 
 typedef struct {
    char *name;
@@ -76,6 +91,12 @@ typedef struct {
    VkExtent3D extent;
    VkFormat format;
 } vulkan_image;
+
+typedef struct {
+    VkBuffer buffer;
+    VmaAllocation allocation;
+    VmaAllocationInfo info;
+} vulkan_buffer;
 
 typedef struct {
    VkCommandPool pool;
@@ -129,4 +150,6 @@ typedef struct {
 
    compute_effect background_effect;
    VkPipeline triangle_pipeline;
+   VkPipeline mesh_pipeline;
+   VkPipelineLayout mesh_pipeline_layout;
 } vulkan_context;

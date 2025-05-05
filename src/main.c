@@ -167,7 +167,7 @@ static void draw_background(vulkan_context *vk, VkDescriptorSet *descriptor_set,
    vkCmdDispatch(cmd, ceilf(vk->draw_extent.width/16.0f), ceilf(vk->draw_extent.height/16.0f), 1);
 }
 
-static void draw_geometry(vulkan_context *vk, VkCommandBuffer cmd)
+static void draw_geometry(vulkan_context *vk, VkCommandBuffer cmd, VkDeviceAddress vertex_buffer_address, VkBuffer index_buffer)
 {
    VkRenderingAttachmentInfo color_attachment_info = {0};
    color_attachment_info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -213,7 +213,78 @@ static void draw_geometry(vulkan_context *vk, VkCommandBuffer cmd)
 
    vkCmdDraw(cmd, 3, 1, 0, 0);
 
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->mesh_pipeline);
+
+   mesh_push_constants push_constants = {0};
+   push_constants.world_matrix = (mat4){
+      {1, 0, 0, 0},
+      {0, 1, 0, 0},
+      {0, 0, 1, 0},
+      {0, 0, 0, 1},
+   };
+   push_constants.vertex_buffer = vertex_buffer_address;
+
+   vkCmdPushConstants(cmd, vk->mesh_pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(push_constants), &push_constants);
+   vkCmdBindIndexBuffer(cmd, index_buffer, 0, VK_INDEX_TYPE_UINT32);
+
+   vkCmdDrawIndexed(cmd, 6, 1, 0, 0, 0);
+
    vkCmdEndRendering(cmd);
+}
+
+static vulkan_buffer create_buffer(VmaAllocator allocator, memory_index size, VkBufferUsageFlags buffer_usage, VmaMemoryUsage memory_usage)
+{
+   VkBufferCreateInfo buffer_info = {0};
+   buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+   buffer_info.size = size;
+   buffer_info.usage = buffer_usage;
+
+   VmaAllocationCreateInfo alloc_info = {0};
+   alloc_info.usage = memory_usage;
+   alloc_info.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+   vulkan_buffer result = {0};
+   VK_CHECK(vmaCreateBuffer(allocator, &buffer_info, &alloc_info, &result.buffer, &result.allocation, &result.info));
+
+   return(result);
+}
+
+typedef void command_function(VkCommandBuffer cmd);
+
+static void immediate_prepare(vulkan_context *vk)
+{
+   VkCommandBuffer cmd = vk->immediate_command_buffer;
+
+   VK_CHECK(vkResetFences(vk->device, 1, &vk->immediate_fence));
+   VK_CHECK(vkResetCommandBuffer(cmd, 0));
+
+   VkCommandBufferBeginInfo begin_info = {0};
+   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+   begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   VK_CHECK(vkBeginCommandBuffer(cmd, &begin_info));
+}
+
+static void immediate_submit(vulkan_context *vk)
+{
+   VkCommandBuffer cmd = vk->immediate_command_buffer;
+
+   VK_CHECK(vkEndCommandBuffer(cmd));
+
+   VkCommandBufferSubmitInfo cmd_info = {0};
+   cmd_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+   cmd_info.commandBuffer = cmd;
+
+   VkSubmitInfo2 submit_info = {0};
+   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+   submit_info.waitSemaphoreInfoCount = 0;
+   submit_info.pWaitSemaphoreInfos = 0;
+   submit_info.signalSemaphoreInfoCount = 0;
+   submit_info.pSignalSemaphoreInfos = 0;
+   submit_info.commandBufferInfoCount = 1;
+   submit_info.pCommandBufferInfos = &cmd_info;
+
+   VK_CHECK(vkQueueSubmit2(vk->graphics_queue, 1, &submit_info, vk->immediate_fence));
+   VK_CHECK(vkWaitForFences(vk->device, 1, &vk->immediate_fence, 0, UINT64_MAX));
 }
 
 int main(void)
@@ -716,20 +787,9 @@ int main(void)
 
    vkUpdateDescriptorSets(vk.device, 1, &draw_image_write, 0, 0);
 
-   // Load shaders.
+   // Initialize compute pipeline.
    VkShaderModule compute_shader_module;
    load_shader_module(&compute_shader_module, vk.device, arena, "shaders/gradient_color.comp.spv");
-
-   VkShaderModule vertex_shader_module;
-   load_shader_module(&vertex_shader_module, vk.device, arena, "shaders/triangle.vert.spv");
-
-   VkShaderModule fragment_shader_module;
-   load_shader_module(&fragment_shader_module, vk.device, arena, "shaders/triangle.frag.spv");
-
-   VkPipelineLayoutCreateInfo pipeline_layout_info = {0};
-   pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-   pipeline_layout_info.pSetLayouts = &layout;
-   pipeline_layout_info.setLayoutCount = 1;
 
    VkPipelineLayoutCreateInfo compute_layout_info = {0};
    compute_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -744,11 +804,8 @@ int main(void)
    compute_layout_info.pPushConstantRanges = &push_constant_range;
    compute_layout_info.pushConstantRangeCount = 1;
 
-   VkPipelineLayout gradient_pipeline_layout;
-   VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout_info, 0, &gradient_pipeline_layout));
-
-   VkPipelineLayout triangle_pipeline_layout;
-   VK_CHECK(vkCreatePipelineLayout(vk.device, &pipeline_layout_info, 0, &triangle_pipeline_layout));
+   VkPipelineLayout compute_pipeline_layout;
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &compute_layout_info, 0, &compute_pipeline_layout));
 
    VkPipelineShaderStageCreateInfo stage_create_info = {0};
    stage_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -758,18 +815,33 @@ int main(void)
 
    VkComputePipelineCreateInfo compute_pipeline_create_info = {0};
    compute_pipeline_create_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
-   compute_pipeline_create_info.layout = gradient_pipeline_layout;
+   compute_pipeline_create_info.layout = compute_pipeline_layout;
    compute_pipeline_create_info.stage = stage_create_info;
 
    compute_effect gradient = {0};
    gradient.name = "gradient";
-   gradient.layout = gradient_pipeline_layout;
+   gradient.layout = compute_pipeline_layout;
    gradient.constants.data[0] = (vec4){1, 0, 0, 1};
    gradient.constants.data[1] = (vec4){0, 0, 1, 1};
 
    VK_CHECK(vkCreateComputePipelines(vk.device, VK_NULL_HANDLE, 1, &compute_pipeline_create_info, 0, &gradient.pipeline));
 
    vk.background_effect = gradient;
+
+   // Initialize triangle pipeline.
+   VkShaderModule vertex_shader_module;
+   load_shader_module(&vertex_shader_module, vk.device, arena, "shaders/triangle.vert.spv");
+
+   VkShaderModule fragment_shader_module;
+   load_shader_module(&fragment_shader_module, vk.device, arena, "shaders/triangle.frag.spv");
+
+   VkPipelineLayoutCreateInfo triangle_layout_info = {0};
+   triangle_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   triangle_layout_info.pSetLayouts = &layout;
+   triangle_layout_info.setLayoutCount = 1;
+
+   VkPipelineLayout triangle_pipeline_layout;
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &triangle_layout_info, 0, &triangle_pipeline_layout));
 
    vulkan_pipeline_configuration triangle_pipeline_config = {0};
    initialize_pipeline_config(&triangle_pipeline_config);
@@ -823,6 +895,81 @@ int main(void)
 
    vk.triangle_pipeline = create_pipeline(&triangle_pipeline_config, vk.device);
 
+   // Initialize mesh pipeline.
+   VkShaderModule vertex_mesh_shader_module;
+   load_shader_module(&vertex_mesh_shader_module, vk.device, arena, "shaders/triangle_mesh.vert.spv");
+
+   VkShaderModule fragment_mesh_shader_module;
+   load_shader_module(&fragment_mesh_shader_module, vk.device, arena, "shaders/triangle_mesh.frag.spv");
+
+   VkPipelineLayoutCreateInfo mesh_layout_info = {0};
+   mesh_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+   mesh_layout_info.pSetLayouts = &layout;
+   mesh_layout_info.setLayoutCount = 1;
+
+   VkPushConstantRange mesh_push_constant_range = {0};
+   mesh_push_constant_range.offset = 0;
+   mesh_push_constant_range.size = sizeof(mesh_push_constants);
+   mesh_push_constant_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+   mesh_layout_info.pPushConstantRanges = &mesh_push_constant_range;
+   mesh_layout_info.pushConstantRangeCount = 1;
+
+   VK_CHECK(vkCreatePipelineLayout(vk.device, &mesh_layout_info, 0, &vk.mesh_pipeline_layout));
+
+   vulkan_pipeline_configuration mesh_pipeline_config = {0};
+   initialize_pipeline_config(&mesh_pipeline_config);
+
+   mesh_pipeline_config.layout = vk.mesh_pipeline_layout;
+   mesh_pipeline_config.input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+   mesh_pipeline_config.input_assembly.primitiveRestartEnable = VK_FALSE;
+
+   mesh_pipeline_config.rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+   mesh_pipeline_config.rasterizer.lineWidth = 1.0f;
+   mesh_pipeline_config.rasterizer.cullMode = VK_CULL_MODE_NONE;
+   mesh_pipeline_config.rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+
+   mesh_pipeline_config.shader_stages[0] = (VkPipelineShaderStageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_VERTEX_BIT,
+      .module = vertex_mesh_shader_module,
+      .pName = "main",
+   };
+   mesh_pipeline_config.shader_stages[1] = (VkPipelineShaderStageCreateInfo){
+      .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+      .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+      .module = fragment_mesh_shader_module,
+      .pName = "main",
+   };
+
+   mesh_pipeline_config.multisampling.sampleShadingEnable = VK_FALSE;
+   mesh_pipeline_config.multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+   mesh_pipeline_config.multisampling.minSampleShading = 1.0f;
+   mesh_pipeline_config.multisampling.pSampleMask = 0;
+   mesh_pipeline_config.multisampling.alphaToCoverageEnable = VK_FALSE;
+   mesh_pipeline_config.multisampling.alphaToOneEnable = VK_FALSE;
+
+   mesh_pipeline_config.color_blend_attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT;
+   mesh_pipeline_config.color_blend_attachment.blendEnable = VK_FALSE;
+
+   mesh_pipeline_config.color_attachment_format = vk.draw_image.format;
+   mesh_pipeline_config.rendering_info.colorAttachmentCount = 1;
+   mesh_pipeline_config.rendering_info.pColorAttachmentFormats = &mesh_pipeline_config.color_attachment_format;
+
+   mesh_pipeline_config.rendering_info.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+   mesh_pipeline_config.depth_stencil.depthTestEnable = VK_FALSE;
+   mesh_pipeline_config.depth_stencil.depthWriteEnable = VK_FALSE;
+   mesh_pipeline_config.depth_stencil.depthCompareOp = VK_COMPARE_OP_NEVER;
+   mesh_pipeline_config.depth_stencil.depthBoundsTestEnable = VK_FALSE;
+   mesh_pipeline_config.depth_stencil.stencilTestEnable = VK_FALSE;
+   mesh_pipeline_config.depth_stencil.front = (VkStencilOpState){0};
+   mesh_pipeline_config.depth_stencil.back = (VkStencilOpState){0};
+   mesh_pipeline_config.depth_stencil.minDepthBounds = 0.f;
+   mesh_pipeline_config.depth_stencil.maxDepthBounds = 1.f;
+
+   vk.mesh_pipeline = create_pipeline(&mesh_pipeline_config, vk.device);
+
+   // Initialize IMGUI.
    VkCommandPool immediate_command_pool;
    VK_CHECK(vkCreateCommandPool(vk.device, &command_pool_info, 0, &immediate_command_pool));
 
@@ -837,6 +984,69 @@ int main(void)
 
    initialize_imgui(&vk);
 
+   vertex vertices[4] = {0};
+   vertices[0].position = (vec3){0.5, -0.5, 0};
+   vertices[1].position = (vec3){0.5, 0.5, 0};
+   vertices[2].position = (vec3){-0.5, -0.5, 0};
+   vertices[3].position = (vec3){-0.5, 0.5, 0};
+
+   vertices[0].color = (vec4){0, 0, 0, 1};
+   vertices[1].color = (vec4){0.5, 0.5, 0.5, 1};
+   vertices[2].color = (vec4){1, 0, 0, 1};
+   vertices[3].color = (vec4){0, 1, 0, 1};
+
+   u32 indices[6] = {0};
+   indices[0] = 0;
+   indices[1] = 1;
+   indices[2] = 2;
+   indices[3] = 2;
+   indices[4] = 1;
+   indices[5] = 3;
+
+   memory_index vertex_buffer_size = sizeof(vertices);
+   memory_index index_buffer_size = sizeof(indices);
+
+   vulkan_buffer vertex_buffer = create_buffer(vk.allocator, vertex_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+   vulkan_buffer index_buffer = create_buffer(vk.allocator, index_buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+   VkBufferDeviceAddressInfo device_address_info = {0};
+   device_address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+   device_address_info.buffer = vertex_buffer.buffer;
+
+   VkDeviceAddress vertex_buffer_address = vkGetBufferDeviceAddress(vk.device, &device_address_info);
+
+   vulkan_buffer staging_buffer = create_buffer(vk.allocator, vertex_buffer_size + index_buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+
+   VmaAllocationInfo staging_allocation_info;
+   vmaGetAllocationInfo(vk.allocator, staging_buffer.allocation, &staging_allocation_info);
+
+   void *staging_data = staging_allocation_info.pMappedData;
+
+   memcpy(staging_data, vertices, vertex_buffer_size);
+   memcpy((char *)staging_data + vertex_buffer_size, indices, index_buffer_size);
+
+   immediate_prepare(&vk);
+   {
+      VkCommandBuffer cmd = vk.immediate_command_buffer;
+
+      VkBufferCopy vertex_copy = {0};
+      vertex_copy.dstOffset = 0;
+      vertex_copy.srcOffset = 0;
+      vertex_copy.size = vertex_buffer_size;
+
+      vkCmdCopyBuffer(cmd, staging_buffer.buffer, vertex_buffer.buffer, 1, &vertex_copy);
+
+      VkBufferCopy index_copy = {0};
+      index_copy.dstOffset = 0;
+      index_copy.srcOffset = vertex_buffer_size;
+      index_copy.size = index_buffer_size;
+
+      vkCmdCopyBuffer(cmd, staging_buffer.buffer, index_buffer.buffer, 1, &index_copy);
+   }
+   immediate_submit(&vk);
+
+   vmaDestroyBuffer(vk.allocator, staging_buffer.buffer, staging_buffer.allocation);
+
    // Render loop.
    while(!window_should_close(&vk))
    {
@@ -845,11 +1055,11 @@ int main(void)
       vk.draw_extent.width = vk.draw_image.extent.width;
       vk.draw_extent.height = vk.draw_image.extent.height;
 
-      VK_CHECK(vkWaitForFences(vk.device, 1, &frame->render_fence, 1, 1000000000));
+      VK_CHECK(vkWaitForFences(vk.device, 1, &frame->render_fence, 1, UINT64_MAX));
       VK_CHECK(vkResetFences(vk.device, 1, &frame->render_fence));
 
       u32 swapchain_image_index;
-      VK_CHECK(vkAcquireNextImageKHR(vk.device, vk.swapchain, 1000000000, frame->swapchain_semaphore, 0, &swapchain_image_index));
+      VK_CHECK(vkAcquireNextImageKHR(vk.device, vk.swapchain, UINT64_MAX, frame->swapchain_semaphore, 0, &swapchain_image_index));
 
       VkCommandBuffer cmd = frame->commands;
       VK_CHECK(vkResetCommandBuffer(cmd, 0));
@@ -864,7 +1074,7 @@ int main(void)
       draw_background(&vk, &descriptor_set, cmd);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-      draw_geometry(&vk, cmd);
+      draw_geometry(&vk, cmd, vertex_buffer_address, index_buffer.buffer);
       draw_imgui(&vk, cmd, vk.draw_image.view);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -919,21 +1129,29 @@ int main(void)
    vkDestroyFence(vk.device, vk.immediate_fence, 0);
    vkDestroyCommandPool(vk.device, immediate_command_pool, 0);
 
+   vmaDestroyBuffer(vk.allocator, index_buffer.buffer, index_buffer.allocation);
+   vmaDestroyBuffer(vk.allocator, vertex_buffer.buffer, vertex_buffer.allocation);
+
    vkDestroyShaderModule(vk.device, compute_shader_module, 0);
    vkDestroyShaderModule(vk.device, vertex_shader_module, 0);
    vkDestroyShaderModule(vk.device, fragment_shader_module, 0);
+   vkDestroyShaderModule(vk.device, vertex_mesh_shader_module, 0);
+   vkDestroyShaderModule(vk.device, fragment_mesh_shader_module, 0);
 
    vkDestroyPipelineLayout(vk.device, vk.background_effect.layout, 0);
    vkDestroyPipelineLayout(vk.device, triangle_pipeline_layout, 0);
+   vkDestroyPipelineLayout(vk.device, vk.mesh_pipeline_layout, 0);
 
    vkDestroyPipeline(vk.device, vk.background_effect.pipeline, 0);
    vkDestroyPipeline(vk.device, vk.triangle_pipeline, 0);
+   vkDestroyPipeline(vk.device, vk.mesh_pipeline, 0);
 
    vkDestroyDescriptorPool(vk.device, pool, 0);
    vkDestroyDescriptorSetLayout(vk.device, layout, 0);
 
    vkDestroyImageView(vk.device, vk.draw_image.view, 0);
    vmaDestroyImage(vk.allocator, vk.draw_image.image, vk.draw_image.allocation);
+
    vmaDestroyAllocator(vk.allocator);
    for(int frame_index = 0; frame_index < countof(vk.frame_commands); ++frame_index)
    {

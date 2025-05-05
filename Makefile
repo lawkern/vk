@@ -12,6 +12,8 @@ compile:
 	glslc -o shaders/gradient_color.comp.spv shaders/gradient_color.comp
 	glslc -o shaders/triangle.vert.spv shaders/triangle.vert
 	glslc -o shaders/triangle.frag.spv shaders/triangle.frag
+	glslc -o shaders/triangle_mesh.vert.spv shaders/triangle_mesh.vert
+	glslc -o shaders/triangle_mesh.frag.spv shaders/triangle_mesh.frag
 
 	$(CC) -c -o build/vma.o -DVMA_IMPLEMENTATION -xc++ dependencies/vk_mem_alloc.h
 	$(CC) -c -o build/wnd.o $(CXXFLAGS) src/window_creation.cpp `pkg-config --cflags sdl3`
