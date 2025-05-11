@@ -249,8 +249,6 @@ static vulkan_buffer create_buffer(VmaAllocator allocator, memory_index size, Vk
    return(result);
 }
 
-typedef void command_function(VkCommandBuffer cmd);
-
 static void immediate_prepare(vulkan_context *vk)
 {
    VkCommandBuffer cmd = vk->immediate_command_buffer;
@@ -287,12 +285,68 @@ static void immediate_submit(vulkan_context *vk)
    VK_CHECK(vkWaitForFences(vk->device, 1, &vk->immediate_fence, 0, UINT64_MAX));
 }
 
+static vulkan_mesh push_mesh(vulkan_context *vk, vertex *vertices, int vertex_count, u32 *indices, int index_count)
+{
+   vulkan_mesh result = {0};
+
+   memory_index vertex_buffer_size = vertex_count * sizeof(*vertices);
+   memory_index index_buffer_size = index_count * sizeof(*indices);
+
+   result.vertices = create_buffer(vk->allocator, vertex_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+   result.indices = create_buffer(vk->allocator, index_buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
+
+   VkBufferDeviceAddressInfo device_address_info = {0};
+   device_address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+   device_address_info.buffer = result.vertices.buffer;
+
+   result.vertex_address = vkGetBufferDeviceAddress(vk->device, &device_address_info);
+
+   vulkan_buffer staging_buffer = create_buffer(vk->allocator, vertex_buffer_size + index_buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
+   VmaAllocationInfo staging_allocation_info;
+   vmaGetAllocationInfo(vk->allocator, staging_buffer.allocation, &staging_allocation_info);
+
+   void *staging_data = staging_allocation_info.pMappedData;
+   memcpy(staging_data, vertices, vertex_buffer_size);
+   memcpy((char *)staging_data + vertex_buffer_size, indices, index_buffer_size);
+
+   immediate_prepare(vk);
+   {
+      VkCommandBuffer cmd = vk->immediate_command_buffer;
+
+      VkBufferCopy vertex_copy = {0};
+      vertex_copy.dstOffset = 0;
+      vertex_copy.srcOffset = 0;
+      vertex_copy.size = vertex_buffer_size;
+
+      vkCmdCopyBuffer(cmd, staging_buffer.buffer, result.vertices.buffer, 1, &vertex_copy);
+
+      VkBufferCopy index_copy = {0};
+      index_copy.dstOffset = 0;
+      index_copy.srcOffset = vertex_buffer_size;
+      index_copy.size = index_buffer_size;
+
+      vkCmdCopyBuffer(cmd, staging_buffer.buffer, result.indices.buffer, 1, &index_copy);
+   }
+   immediate_submit(vk);
+
+   vmaDestroyBuffer(vk->allocator, staging_buffer.buffer, staging_buffer.allocation);
+
+
+
+   return(result);
+}
+
 int main(void)
 {
    memory_index arena_size = 1024*1024;
    memory_arena arena = {0};
    arena.begin = malloc(arena_size);
    arena.end = arena.begin + arena_size;
+
+   memory_index scratch_size = 1024*1024;
+   memory_arena scratch = {0};
+   scratch.begin = malloc(scratch_size);
+   scratch.end = scratch.begin + scratch_size;
 
    // Enable instance extensions.
    u32 instance_extension_count = 0;
@@ -789,7 +843,7 @@ int main(void)
 
    // Initialize compute pipeline.
    VkShaderModule compute_shader_module;
-   load_shader_module(&compute_shader_module, vk.device, arena, "shaders/gradient_color.comp.spv");
+   load_shader_module(&compute_shader_module, vk.device, arena, "gradient_color.comp.spv");
 
    VkPipelineLayoutCreateInfo compute_layout_info = {0};
    compute_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -830,10 +884,10 @@ int main(void)
 
    // Initialize triangle pipeline.
    VkShaderModule vertex_shader_module;
-   load_shader_module(&vertex_shader_module, vk.device, arena, "shaders/triangle.vert.spv");
+   load_shader_module(&vertex_shader_module, vk.device, arena, "triangle.vert.spv");
 
    VkShaderModule fragment_shader_module;
-   load_shader_module(&fragment_shader_module, vk.device, arena, "shaders/triangle.frag.spv");
+   load_shader_module(&fragment_shader_module, vk.device, arena, "triangle.frag.spv");
 
    VkPipelineLayoutCreateInfo triangle_layout_info = {0};
    triangle_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -897,10 +951,10 @@ int main(void)
 
    // Initialize mesh pipeline.
    VkShaderModule vertex_mesh_shader_module;
-   load_shader_module(&vertex_mesh_shader_module, vk.device, arena, "shaders/triangle_mesh.vert.spv");
+   load_shader_module(&vertex_mesh_shader_module, vk.device, arena, "triangle_mesh.vert.spv");
 
    VkShaderModule fragment_mesh_shader_module;
-   load_shader_module(&fragment_mesh_shader_module, vk.device, arena, "shaders/triangle_mesh.frag.spv");
+   load_shader_module(&fragment_mesh_shader_module, vk.device, arena, "triangle_mesh.frag.spv");
 
    VkPipelineLayoutCreateInfo mesh_layout_info = {0};
    mesh_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1003,49 +1057,7 @@ int main(void)
    indices[4] = 1;
    indices[5] = 3;
 
-   memory_index vertex_buffer_size = sizeof(vertices);
-   memory_index index_buffer_size = sizeof(indices);
-
-   vulkan_buffer vertex_buffer = create_buffer(vk.allocator, vertex_buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-   vulkan_buffer index_buffer = create_buffer(vk.allocator, index_buffer_size, VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VMA_MEMORY_USAGE_GPU_ONLY);
-
-   VkBufferDeviceAddressInfo device_address_info = {0};
-   device_address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
-   device_address_info.buffer = vertex_buffer.buffer;
-
-   VkDeviceAddress vertex_buffer_address = vkGetBufferDeviceAddress(vk.device, &device_address_info);
-
-   vulkan_buffer staging_buffer = create_buffer(vk.allocator, vertex_buffer_size + index_buffer_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_CPU_ONLY);
-
-   VmaAllocationInfo staging_allocation_info;
-   vmaGetAllocationInfo(vk.allocator, staging_buffer.allocation, &staging_allocation_info);
-
-   void *staging_data = staging_allocation_info.pMappedData;
-
-   memcpy(staging_data, vertices, vertex_buffer_size);
-   memcpy((char *)staging_data + vertex_buffer_size, indices, index_buffer_size);
-
-   immediate_prepare(&vk);
-   {
-      VkCommandBuffer cmd = vk.immediate_command_buffer;
-
-      VkBufferCopy vertex_copy = {0};
-      vertex_copy.dstOffset = 0;
-      vertex_copy.srcOffset = 0;
-      vertex_copy.size = vertex_buffer_size;
-
-      vkCmdCopyBuffer(cmd, staging_buffer.buffer, vertex_buffer.buffer, 1, &vertex_copy);
-
-      VkBufferCopy index_copy = {0};
-      index_copy.dstOffset = 0;
-      index_copy.srcOffset = vertex_buffer_size;
-      index_copy.size = index_buffer_size;
-
-      vkCmdCopyBuffer(cmd, staging_buffer.buffer, index_buffer.buffer, 1, &index_copy);
-   }
-   immediate_submit(&vk);
-
-   vmaDestroyBuffer(vk.allocator, staging_buffer.buffer, staging_buffer.allocation);
+   vulkan_mesh mesh_buffers = push_mesh(&vk, vertices, countof(vertices), indices, countof(indices));
 
    // Render loop.
    while(!window_should_close(&vk))
@@ -1074,7 +1086,7 @@ int main(void)
       draw_background(&vk, &descriptor_set, cmd);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-      draw_geometry(&vk, cmd, vertex_buffer_address, index_buffer.buffer);
+      draw_geometry(&vk, cmd, mesh_buffers.vertex_address, mesh_buffers.indices.buffer);
       draw_imgui(&vk, cmd, vk.draw_image.view);
 
       transition_image(cmd, vk.draw_image.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -1129,8 +1141,8 @@ int main(void)
    vkDestroyFence(vk.device, vk.immediate_fence, 0);
    vkDestroyCommandPool(vk.device, immediate_command_pool, 0);
 
-   vmaDestroyBuffer(vk.allocator, index_buffer.buffer, index_buffer.allocation);
-   vmaDestroyBuffer(vk.allocator, vertex_buffer.buffer, vertex_buffer.allocation);
+   vmaDestroyBuffer(vk.allocator, mesh_buffers.indices.buffer, mesh_buffers.indices.allocation);
+   vmaDestroyBuffer(vk.allocator, mesh_buffers.vertices.buffer, mesh_buffers.vertices.allocation);
 
    vkDestroyShaderModule(vk.device, compute_shader_module, 0);
    vkDestroyShaderModule(vk.device, vertex_shader_module, 0);

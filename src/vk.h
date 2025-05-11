@@ -29,9 +29,11 @@
 #endif
 
 #include <stdint.h>
-typedef int32_t b32;
+typedef uint8_t u8;
 typedef uint32_t u32;
 typedef uint64_t u64;
+
+typedef int32_t b32;
 
 #include <stddef.h>
 typedef ptrdiff_t memory_index;
@@ -97,6 +99,21 @@ typedef struct {
     VmaAllocation allocation;
     VmaAllocationInfo info;
 } vulkan_buffer;
+
+typedef struct {
+   memory_index start_index;
+   memory_index count;
+} geometry_surface;
+
+typedef struct {
+   char *name;
+
+   geometry_surface *surfaces;
+
+   vulkan_buffer vertices;
+   vulkan_buffer indices;
+   VkDeviceAddress vertex_address;
+} vulkan_mesh;
 
 typedef struct {
    VkCommandPool pool;
